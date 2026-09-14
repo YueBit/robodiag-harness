@@ -228,6 +228,8 @@ pip install -e ".[all]"
 
 ## REPL commands
 
+![RoboDiag REPL commands](assets/repl-commands.webp)
+
 ```
 /graph                         ROS graph summary
 /diagnostics                   Standard /diagnostics status
