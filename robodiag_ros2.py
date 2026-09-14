@@ -966,7 +966,12 @@ class SafetyGate:
         self.max_joint_age_s = max_joint_age_s
 
     def check_for_motion(self) -> dict[str, Any]:
-        """Fail closed for evidence that exists but is unhealthy/stale."""
+        """Fail closed: deny motion unless required evidence is present and healthy.
+
+        Missing evidence (no /diagnostics, battery, or /joint_states) is treated
+        as unsafe, never as "normal". This matches the design principle that
+        "no data" must not permit motion.
+        """
         checks: list[dict[str, Any]] = []
         allow = True
 
@@ -984,7 +989,8 @@ class SafetyGate:
                 else:
                     checks.append({"check": "diagnostics", "ok": True})
         else:
-            checks.append({"check": "diagnostics", "ok": None, "reason": "no /diagnostics evidence"})
+            allow = False
+            checks.append({"check": "diagnostics", "ok": False, "reason": "no /diagnostics evidence (missing)"})
 
         battery = self.node.battery_state()
         if battery.get("available"):
@@ -1003,7 +1009,8 @@ class SafetyGate:
                 else:
                     checks.append({"check": "battery", "ok": True, "value": battery})
         else:
-            checks.append({"check": "battery", "ok": None, "reason": "no BatteryState topic discovered"})
+            allow = False
+            checks.append({"check": "battery", "ok": False, "reason": "no BatteryState topic discovered (missing)"})
 
         joint = self.node.joint_state_cached()
         if joint.get("available"):
@@ -1013,7 +1020,8 @@ class SafetyGate:
             else:
                 checks.append({"check": "joint_states_fresh", "ok": True, "age_s": joint["age_s"]})
         else:
-            checks.append({"check": "joint_states", "ok": None, "reason": "no /joint_states evidence"})
+            allow = False
+            checks.append({"check": "joint_states", "ok": False, "reason": "no /joint_states evidence (missing)"})
 
         return {"allow": allow, "checks": checks}
 
@@ -1821,7 +1829,10 @@ def main(argv: list[str] | None = None) -> int:
     play_banner()
 
     # Pass ROS-specific args through to rclpy; our own args were already parsed.
-    rclpy.init(args=ros_unknown)
+    # rclpy/rcl treat args[0] as the program name and only scan args[1:] for
+    # the --ros-args marker. parse_known_args strips argv[0], so re-add it or
+    # ROS remappings/params would be silently dropped.
+    rclpy.init(args=[sys.argv[0], *ros_unknown])
     node = HarnessNode(
         controller_manager=args.controller_manager,
         cmd_vel_topic=args.cmd_vel_topic,
