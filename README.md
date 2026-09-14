@@ -50,15 +50,17 @@ can access them from one place.
 
 ### 1. Prepare your robot
 
-RoboDiag can run **on the robot's computer** or **on a separate computer** that
-can reach the robot over the network. ROS 2 is distributed, so nodes may live on
-different machines. In both cases:
+For most robots, the simplest setup is to run RoboDiag **on the robot's own
+computer**, next to the robot's ROS 2 software:
 
-- ROS 2 is installed on the machine running RoboDiag.
+- ROS 2 is installed on that computer.
 - Your robot's ROS 2 software is running.
-- The computer running RoboDiag can communicate with your robot.
+- RoboDiag can reach the robot's topics, services and actions over the local
+  ROS graph.
 
-If RoboDiag runs on a **separate computer**, also make sure that:
+You can also run RoboDiag **on a separate computer** (ROS 2 is distributed, so
+nodes may live on different machines). In that case, additionally make sure
+that:
 
 - Both machines are on the same network and DDS discovery traffic is not
   blocked by a firewall.
