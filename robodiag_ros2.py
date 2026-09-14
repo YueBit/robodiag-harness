@@ -156,7 +156,7 @@ except ImportError:
     OpenAI = None  # AI remains optional
 
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 # DiagnosticStatus.level is a `byte` field; on ROS 2 Humble the class constants
 # are `bytes` (b'\x00'..b'\x03'), so use plain ints internally.
