@@ -77,6 +77,44 @@ from pathlib import Path
 from typing import Any, Callable
 
 # ──────────────────────────────────────────────────────────────────────────────
+# REPL line editing / completion
+#
+# prompt_toolkit provides a live completion menu (dropdown) for slash commands.
+# readline is kept as a fallback so Console.input() still handles arrow keys and
+# history when prompt_toolkit is missing or stdin is not a TTY.
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    from prompt_toolkit.completion import Completer, Completion
+    from prompt_toolkit.formatted_text import ANSI as _ANSI
+    from prompt_toolkit.history import FileHistory
+
+    _HAVE_PROMPT_TOOLKIT = True
+except ImportError:  # pragma: no cover - optional dependency
+    _HAVE_PROMPT_TOOLKIT = False
+
+try:
+    import atexit
+    import readline
+
+    _HISTORY_FILE = Path.home() / ".robodiag_ros2_readline_history"
+    try:
+        readline.read_history_file(_HISTORY_FILE)
+    except OSError:
+        pass
+    readline.set_history_length(1000)
+
+    def _save_readline_history() -> None:
+        try:
+            readline.write_history_file(_HISTORY_FILE)
+        except OSError:
+            pass
+
+    atexit.register(_save_readline_history)
+except ImportError:  # pragma: no cover - readline missing on some Python builds
+    pass
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Friendly dependency checks
 # ──────────────────────────────────────────────────────────────────────────────
 try:
@@ -416,6 +454,78 @@ class HistoryStore:
 # ──────────────────────────────────────────────────────────────────────────────
 # ROS 2 probe node
 # ──────────────────────────────────────────────────────────────────────────────
+class _TopicCollector:
+    """Message sink for a long-lived ad-hoc topic subscription.
+
+    rclpy's MultiThreadedExecutor corrupts its wait set when a subscription is
+    destroyed from a non-executor thread while the executor is spinning; after
+    that, newly created subscriptions never receive messages. The harness keeps
+    one subscription per probed topic for the whole session and routes deliveries
+    through this collector instead of create/destroy churn.
+    """
+
+    def __init__(self, type_name: str) -> None:
+        self.type_name = type_name
+        self._lock = threading.Lock()
+        self._collecting = False
+        self._sample = False
+        self._start = 0.0
+        self._duration = 0.0
+        self._min_interval = 0.0
+        self._last_kept = 0.0
+        self._sink: list[dict[str, Any]] = []
+        self._first: dict[str, Any] | None = None
+        self._first_at: str | None = None
+        self._error: str | None = None
+        self.first_event = threading.Event()
+        self.done_event = threading.Event()
+
+    def on_message(self, msg: Any) -> None:
+        with self._lock:
+            if not self._collecting:
+                return
+            now = time.monotonic()
+            if now - self._start > self._duration:
+                self.done_event.set()
+                return
+            if now - self._last_kept < self._min_interval:
+                return
+            self._last_kept = now
+            try:
+                data = to_builtin_message(msg)
+            except Exception as exc:  # noqa: BLE001
+                self._error = f"message conversion failed: {type(exc).__name__}: {exc}"
+                self.first_event.set()
+                self.done_event.set()
+                return
+            if self._first is None:
+                self._first = data
+                self._first_at = now_iso()
+                self.first_event.set()
+            if self._sample:
+                self._sink.append(data)
+
+    def start(self, duration_s: float, rate_hz: float, sample: bool) -> None:
+        with self._lock:
+            self._collecting = True
+            self._sample = sample
+            self._start = time.monotonic()
+            self._duration = duration_s
+            self._min_interval = 0.0 if rate_hz <= 0 else 1.0 / rate_hz
+            self._last_kept = 0.0
+            self._sink = []
+            self._first = None
+            self._first_at = None
+            self._error = None
+            self.first_event.clear()
+            self.done_event.clear()
+
+    def finish(self) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None, str | None]:
+        with self._lock:
+            self._collecting = False
+            return list(self._sink), self._first, self._first_at, self._error
+
+
 class HarnessNode(Node):
     def __init__(
         self,
@@ -439,6 +549,10 @@ class HarnessNode(Node):
         self._joint_lock = threading.Lock()
         self._last_joint_state: dict[str, Any] | None = None
         self._last_joint_monotonic: float | None = None
+
+        # Long-lived subscriptions for ad-hoc topic probing; see _dynamic_subscription().
+        self._dyn_lock = threading.Lock()
+        self._dyn_subs: dict[str, tuple[_TopicCollector, str, Any]] = {}
 
         # Best-effort subscriber is compatible with both common best-effort sensor
         # publishers and reliable publishers.
@@ -599,49 +713,56 @@ class HarnessNode(Node):
             return None, type_name, f"cannot import {type_name}: {exc}"
         return msg_type, type_name, None
 
+    def _dynamic_subscription(
+        self, topic: str
+    ) -> tuple[_TopicCollector | None, str | None, str | None]:
+        """Return a reusable collector for `topic`, creating its subscription once.
+
+        Subscriptions are never destroyed while the executor spins: doing so from
+        the REPL thread corrupts rclpy's MultiThreadedExecutor wait set, after
+        which further subscriptions silently receive nothing.
+        """
+        with self._dyn_lock:
+            entry = self._dyn_subs.get(topic)
+            if entry is not None:
+                return entry[0], entry[1], None
+            msg_type, type_name, err = self.resolve_topic_type(topic)
+            if err:
+                return None, None, err
+            collector = _TopicCollector(type_name)
+            sub = self.create_subscription(msg_type, topic, collector.on_message, self.sensor_qos)
+            self._dyn_subs[topic] = (collector, type_name, sub)
+            return collector, type_name, None
+
     def topic_snapshot(self, topic: str, timeout_s: float = 3.0) -> dict[str, Any]:
         timeout_s = max(0.2, min(float(timeout_s), 15.0))
-        msg_type, type_name, err = self.resolve_topic_type(topic)
+        collector, type_name, err = self._dynamic_subscription(topic)
         if err:
             return {"ok": False, "error": err, "topic": topic}
+        assert collector is not None and type_name is not None
 
-        event = threading.Event()
-        box: dict[str, Any] = {}
-
-        def cb(msg: Any) -> None:
-            if event.is_set():
-                return
-            try:
-                box["message"] = to_builtin_message(msg)
-                box["received_at"] = now_iso()
-            except Exception as exc:  # noqa: BLE001
-                box["error"] = f"message conversion failed: {type(exc).__name__}: {exc}"
-            finally:
-                event.set()
-
-        sub = self.create_subscription(msg_type, topic, cb, self.sensor_qos)
+        collector.start(timeout_s, rate_hz=0.0, sample=False)
         try:
-            if not event.wait(timeout_s):
-                return {
-                    "ok": False,
-                    "topic": topic,
-                    "type": type_name,
-                    "error": f"no message within {timeout_s:.1f}s",
-                }
-            if "error" in box:
-                return {"ok": False, "topic": topic, "type": type_name, "error": box["error"]}
+            got = collector.first_event.wait(timeout_s)
+        finally:
+            _, first, first_at, conv_err = collector.finish()
+
+        if conv_err:
+            return {"ok": False, "topic": topic, "type": type_name, "error": conv_err}
+        if not got or first is None:
             return {
-                "ok": True,
+                "ok": False,
                 "topic": topic,
                 "type": type_name,
-                "received_at": box["received_at"],
-                "message": box["message"],
+                "error": f"no message within {timeout_s:.1f}s",
             }
-        finally:
-            try:
-                self.destroy_subscription(sub)
-            except Exception:
-                pass
+        return {
+            "ok": True,
+            "topic": topic,
+            "type": type_name,
+            "received_at": first_at or now_iso(),
+            "message": first,
+        }
 
     def sample_topic(
         self,
@@ -651,45 +772,20 @@ class HarnessNode(Node):
     ) -> dict[str, Any]:
         duration_s = max(0.5, min(float(duration_s), 30.0))
         rate_hz = max(0.2, min(float(rate_hz), 50.0))
-        msg_type, type_name, err = self.resolve_topic_type(topic)
+        collector, type_name, err = self._dynamic_subscription(topic)
         if err:
             return {"ok": False, "error": err, "topic": topic}
+        assert collector is not None and type_name is not None
 
-        samples: list[dict[str, Any]] = []
-        lock = threading.Lock()
-        start = time.monotonic()
-        last_kept = 0.0
-        min_interval = 1.0 / rate_hz
-        done = threading.Event()
-
-        def cb(msg: Any) -> None:
-            nonlocal last_kept
-            now = time.monotonic()
-            if now - start > duration_s:
-                done.set()
-                return
-            if now - last_kept < min_interval:
-                return
-            try:
-                data = to_builtin_message(msg)
-            except Exception:
-                return
-            with lock:
-                samples.append(data)
-            last_kept = now
-
-        sub = self.create_subscription(msg_type, topic, cb, self.sensor_qos)
+        collector.start(duration_s, rate_hz=rate_hz, sample=True)
         try:
-            # Sampling is based on wall time; executor receives callbacks in background.
-            done.wait(duration_s + 0.15)
+            # Sampling is based on wall time; the executor receives callbacks in background.
+            collector.done_event.wait(duration_s + 0.15)
         finally:
-            try:
-                self.destroy_subscription(sub)
-            except Exception:
-                pass
+            rows, _, _, conv_err = collector.finish()
 
-        with lock:
-            rows = list(samples)
+        if conv_err:
+            return {"ok": False, "topic": topic, "type": type_name, "error": conv_err}
         if not rows:
             return {
                 "ok": False,
@@ -1345,6 +1441,113 @@ HELP = f"""[bold]RoboDiag ROS 2 Harness v{VERSION}[/bold]
 Any other input → AI Diagnostic Agent (requires DEEPSEEK_API_KEY).
 """
 
+# Slash commands offered by the completion menu (name, description).
+REPL_COMMANDS: list[tuple[str, str]] = [
+    ("/help", "Show help"),
+    ("/graph", "ROS graph summary"),
+    ("/diagnostics", "Standard /diagnostics status"),
+    ("/control", "ros2_control status"),
+    ("/check", "Composite read-only health check"),
+    ("/topic", "Snapshot one message from a topic"),
+    ("/sample", "Sample a topic over a time window"),
+    ("/tests", "Test catalog"),
+    ("/run", "Run a deterministic test"),
+    ("/history", "Recent test runs"),
+    ("/safety", "Show the motion Safety Gate"),
+    ("/stop", "Software stop (zero cmd_vel + optional Trigger)"),
+    ("/quit", "Quit"),
+]
+
+if _HAVE_PROMPT_TOOLKIT:
+
+    class SlashCommandCompleter(Completer):
+        """Live dropdown for slash commands, topic names and test ids."""
+
+        def __init__(
+            self,
+            topic_provider: Callable[[], list[str]],
+            test_provider: Callable[[], dict[str, Any]],
+        ) -> None:
+            self._topic_provider = topic_provider
+            self._test_provider = test_provider
+
+        def get_completions(self, document: Any, complete_event: Any):
+            stripped = document.text_before_cursor.lstrip()
+            if not stripped.startswith("/"):
+                return
+
+            trailing_space = stripped.endswith(" ")
+            tokens = stripped.split()
+            if not tokens:
+                return
+            command = tokens[0]
+
+            # Completing the command name itself (e.g. typing "/" or "/gr").
+            if len(tokens) == 1 and not trailing_space:
+                fragment = command
+                for name, description in REPL_COMMANDS:
+                    if name.startswith(fragment):
+                        yield Completion(
+                            name,
+                            start_position=-len(fragment),
+                            display=name,
+                            display_meta=description,
+                        )
+                return
+
+            # Only the first argument is completed; anything past it is freeform.
+            if (trailing_space and len(tokens) >= 2) or len(tokens) >= 3:
+                return
+            fragment = tokens[1] if len(tokens) >= 2 else ""
+
+            if command in ("/topic", "/sample"):
+                for topic in self._topic_provider():
+                    if topic.startswith(fragment):
+                        yield Completion(
+                            topic,
+                            start_position=-len(fragment),
+                            display=topic,
+                            display_meta="topic",
+                        )
+            elif command == "/run":
+                for test_id, spec in self._test_provider().items():
+                    if test_id.startswith(fragment):
+                        yield Completion(
+                            test_id,
+                            start_position=-len(fragment),
+                            display=test_id,
+                            display_meta=str(spec.get("name", "")),
+                        )
+
+
+def _make_prompt_session(node: HarnessNode) -> Any | None:
+    """Create the interactive prompt with completion, or None for the fallback."""
+    if not _HAVE_PROMPT_TOOLKIT or not sys.stdin.isatty():
+        return None
+
+    topic_cache: dict[str, Any] = {"at": 0.0, "items": []}
+
+    def topic_provider() -> list[str]:
+        now = time.monotonic()
+        if now - topic_cache["at"] > 2.0:
+            try:
+                topic_cache["items"] = sorted(name for name, _ in node.get_topic_names_and_types())
+            except Exception:
+                pass
+            topic_cache["at"] = now
+        return topic_cache["items"]
+
+    try:
+        return PromptSession(
+            message=_ANSI("\n\x1b[1;38;5;45mros2 ❯ \x1b[0m"),
+            completer=SlashCommandCompleter(topic_provider, lambda: TEST_CATALOG),
+            complete_while_typing=True,
+            history=FileHistory(str(Path.home() / ".robodiag_ros2_history")),
+            auto_suggest=AutoSuggestFromHistory(),
+        )
+    except Exception:
+        return None
+
 
 def print_graph(g: dict[str, Any]) -> None:
     s = g.get("summary", {})
@@ -1448,9 +1651,14 @@ def repl(
     chat_history: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
     console.print(HELP)
 
+    prompt_session = _make_prompt_session(node)
+
     while True:
         try:
-            line = console.input("\n[bold #00E5FF]ros2 ❯ [/bold #00E5FF]").strip()
+            if prompt_session is not None:
+                line = prompt_session.prompt().strip()
+            else:
+                line = console.input("\n[bold #00E5FF]ros2 ❯ [/bold #00E5FF]").strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]Goodbye 🤖[/dim]")
             break
@@ -1572,11 +1780,16 @@ def repl(
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
-def build_llm_client() -> tuple[Any | None, str]:
+def build_llm_client(
+    api_key_override: str | None = None,
+    base_url_override: str | None = None,
+    model_override: str | None = None,
+) -> tuple[Any | None, str]:
     env_file = load_env(Path.home() / ".robodiag.env")
-    api_key = os.environ.get("DEEPSEEK_API_KEY") or env_file.get("DEEPSEEK_API_KEY", "")
-    base_url = os.environ.get("DEEPSEEK_BASE_URL") or env_file.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    model = os.environ.get("DEEPSEEK_MODEL") or env_file.get("DEEPSEEK_MODEL", "deepseek-chat")
+    # Precedence: CLI flag > environment variable > ~/.robodiag.env > built-in default.
+    api_key = api_key_override or os.environ.get("DEEPSEEK_API_KEY") or env_file.get("DEEPSEEK_API_KEY", "")
+    base_url = base_url_override or os.environ.get("DEEPSEEK_BASE_URL") or env_file.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    model = model_override or os.environ.get("DEEPSEEK_MODEL") or env_file.get("DEEPSEEK_MODEL", "deepseek-chat")
     if not api_key or "your-api-key" in api_key:
         return None, model
     if OpenAI is None:
@@ -1595,6 +1808,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cmd-vel-topic", default="/cmd_vel", help="fallback software-stop Twist topic")
     parser.add_argument("--estop-service", default="", help="optional std_srvs/Trigger E-stop service")
     parser.add_argument("--db", default=os.environ.get("ROBODIAG_DB", "~/.robodiag_ros2.db"))
+    parser.add_argument("--model", default="", help="LLM model name; overrides DEEPSEEK_MODEL")
+    parser.add_argument("--base-url", default="", help="OpenAI-compatible base URL; overrides DEEPSEEK_BASE_URL")
+    parser.add_argument(
+        "--api-key",
+        default="",
+        help="LLM API key; overrides DEEPSEEK_API_KEY (WARNING: visible in `ps` and shell history)",
+    )
+    parser.add_argument("--api-key-file", default="", help="read the API key from a file (safer than --api-key)")
     args, ros_unknown = parser.parse_known_args(argv)
 
     play_banner()
@@ -1626,7 +1847,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     runner = TestRunner(node, history_store)
     runtime = AgentRuntime(node, runner, history_store, gate)
-    llm_client, model = build_llm_client()
+
+    cli_api_key = args.api_key
+    if not cli_api_key and args.api_key_file:
+        try:
+            cli_api_key = Path(args.api_key_file).expanduser().read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            print(f"robodiag: cannot read --api-key-file: {exc}", file=sys.stderr)
+            return 2
+    if args.api_key:
+        console.print(
+            "[yellow]Warning: --api-key is visible in `ps` and shell history; "
+            "prefer DEEPSEEK_API_KEY or --api-key-file.[/yellow]"
+        )
+    llm_client, model = build_llm_client(
+        api_key_override=cli_api_key or None,
+        base_url_override=args.base_url or None,
+        model_override=args.model or None,
+    )
 
     graph = node.inspect_graph()
     console.print(
