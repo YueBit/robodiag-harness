@@ -50,14 +50,26 @@ can access them from one place.
 
 ### 1. Prepare your robot
 
-Make sure:
+RoboDiag can run **on the robot's computer** or **on a separate computer** that
+can reach the robot over the network. ROS 2 is distributed, so nodes may live on
+different machines. In both cases:
 
-- ROS 2 is installed.
+- ROS 2 is installed on the machine running RoboDiag.
 - Your robot's ROS 2 software is running.
 - The computer running RoboDiag can communicate with your robot.
 
-The launcher looks for ROS 2 under `/opt/ros`. It uses the distribution
-identified by `ROS_DISTRO` when available, otherwise it tries Humble.
+If RoboDiag runs on a **separate computer**, also make sure that:
+
+- Both machines are on the same network and DDS discovery traffic is not
+  blocked by a firewall.
+- `ROS_DOMAIN_ID` matches on both machines.
+- The ROS 2 distribution and message packages match — if the robot uses custom
+  messages, source its workspace overlay (with `ROBODIAG_WS`, see step 3).
+
+The launcher looks for ROS 2 under `/opt/ros` on the local machine. It uses the
+distribution identified by `ROS_DISTRO` when available, otherwise it tries
+Humble. RoboDiag does not use the robot's ROS installation remotely — the
+machine it runs on must have ROS 2 installed.
 
 ### 2. Download the project
 
