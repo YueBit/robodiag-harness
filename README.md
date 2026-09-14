@@ -147,6 +147,13 @@ optional `ROBODIAG_WS` overlay automatically:
 ROBODIAG_WS=~/robot_ws ./robodiag --estop-service /emergency_stop
 ```
 
+The launcher expects ROS under `/opt/ros`: if `ROS_DISTRO` is set it uses exactly
+that distro and **fails loudly** if its `setup.bash` is missing; otherwise it
+defaults to Humble. If `ROBODIAG_WS` is set but has no built `install/setup.bash`,
+it also exits with an error instead of silently continuing without your custom
+messages/services. The launcher is symlink-safe, so
+`ln -s …/robodiag-harness/robodiag ~/.local/bin/robodiag` works too.
+
 You can also run the script directly:
 
 ```bash

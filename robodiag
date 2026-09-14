@@ -1,33 +1,66 @@
 #!/usr/bin/env bash
 # RoboDiag ROS 2 Diagnostic Harness — generic launcher
 #
-# Sources the ROS 2 environment (and an optional workspace overlay), then starts
-# the harness. Any arguments are forwarded to robodiag_ros2.py.
+# Sources a ROS 2 environment (from /opt/ros) and an optional robot workspace
+# overlay, then starts the harness. Any arguments are forwarded to
+# robodiag_ros2.py.
 #
 # Examples:
 #   ./robodiag
 #   ./robodiag --cmd-vel-topic /cmd_vel --estop-service /emergency_stop
+#   ROS_DISTRO=jazzy ./robodiag
 #   ROBODIAG_WS=~/robot_ws ./robodiag
 set -e
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve the real location of this script, so a `ln -s` into ~/.local/bin (or
+# any other directory) still finds robodiag_ros2.py next to the launcher.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    case "$SOURCE" in
+        /*) ;;
+        *) SOURCE="$DIR/$SOURCE" ;;
+    esac
+done
+HERE="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
 
-# Locate a ROS 2 environment.
-if [ -n "${ROS_DISTRO:-}" ] && [ -f "/opt/ros/${ROS_DISTRO}/setup.bash" ]; then
+# ── ROS 2 environment ──────────────────────────────────────────────
+# ROS must be installed under /opt/ros. When ROS_DISTRO is set, use exactly
+# that distro and fail loudly if it is missing; otherwise default to Humble.
+if [ -n "${ROS_DISTRO:-}" ]; then
+    ROS_SETUP="/opt/ros/${ROS_DISTRO}/setup.bash"
+    if [ ! -f "$ROS_SETUP" ]; then
+        echo "robodiag: ROS 2 setup not found: $ROS_SETUP" >&2
+        echo "ROS_DISTRO=${ROS_DISTRO} is set, but its setup.bash does not exist." >&2
+        exit 1
+    fi
     # shellcheck disable=SC1090
-    . "/opt/ros/${ROS_DISTRO}/setup.bash"
-elif [ -f /opt/ros/humble/setup.bash ]; then
-    # shellcheck disable=SC1091
-    . /opt/ros/humble/setup.bash
+    . "$ROS_SETUP"
 else
-    echo "robodiag: could not find a ROS 2 setup.bash under /opt/ros" >&2
-    exit 1
+    ROS_SETUP="/opt/ros/humble/setup.bash"
+    if [ ! -f "$ROS_SETUP" ]; then
+        echo "robodiag: ROS 2 setup not found: $ROS_SETUP" >&2
+        echo "Set ROS_DISTRO (e.g. export ROS_DISTRO=jazzy), or install ROS 2 under /opt/ros." >&2
+        exit 1
+    fi
+    # shellcheck disable=SC1091
+    . "$ROS_SETUP"
 fi
 
-# Optional robot workspace overlay.
-if [ -n "${ROBODIAG_WS:-}" ] && [ -f "${ROBODIAG_WS}/install/setup.bash" ]; then
+# ── Optional robot workspace overlay ───────────────────────────────
+# If ROBODIAG_WS is set, its install/setup.bash MUST exist. Silently skipping
+# it would leave custom messages/services missing and surface as confusing
+# errors much later, far from the real cause.
+if [ -n "${ROBODIAG_WS:-}" ]; then
+    OVERLAY="${ROBODIAG_WS}/install/setup.bash"
+    if [ ! -f "$OVERLAY" ]; then
+        echo "robodiag: workspace setup not found: $OVERLAY" >&2
+        echo "Check ROBODIAG_WS and build the workspace first (e.g. colcon build)." >&2
+        exit 1
+    fi
     # shellcheck disable=SC1090
-    . "${ROBODIAG_WS}/install/setup.bash"
+    . "$OVERLAY"
 fi
 
 exec python3 "$HERE/robodiag_ros2.py" "$@"
