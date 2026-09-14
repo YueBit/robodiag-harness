@@ -104,19 +104,42 @@ that can decide *which* evidence to collect next.
 
 ---
 
-## Quick start
+## Install
+
+`pip install` provides the `robodiag` console command. **rclpy and the ROS
+message packages are not on PyPI** — they come from your ROS 2 distribution, so
+source ROS before running.
 
 ```bash
+# from PyPI (once published)
+pip install robodiag-harness             # core (rich only)
+pip install "robodiag-harness[all]"      # + prompt_toolkit completion + openai agent
+
+# from source / editable
 git clone https://github.com/YueBit/robodiag-harness.git
 cd robodiag-harness
-python3 -m pip install --user rich prompt_toolkit openai   # openai is optional
-
-source /opt/ros/humble/setup.bash
-source ~/robot_ws/install/setup.bash       # your robot workspace, if any
-./robodiag
+pip install -e ".[all]"
 ```
 
-The `robodiag` launcher auto-sources ROS 2 and an optional workspace overlay:
+> ROS 2 Humble images ship setuptools < 61 and may have no PyPI access. In that
+> case build with the system setuptools instead of an isolated one:
+>
+> ```bash
+> pip install --user --no-build-isolation ".[all]"
+> ```
+
+## Quick start
+
+In a shell where ROS is sourced, the installed `robodiag` command is enough:
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/robot_ws/install/setup.bash       # your robot workspace, if any
+robodiag
+```
+
+The repo also ships a **bash launcher** (`./robodiag`) that sources ROS 2 and an
+optional `ROBODIAG_WS` overlay automatically:
 
 ```bash
 ./robodiag
@@ -129,6 +152,10 @@ You can also run the script directly:
 ```bash
 python3 robodiag_ros2.py
 ```
+
+> The pip console command and the repo's bash launcher are both named `robodiag`.
+> Only the bash launcher auto-sources ROS; the console command assumes ROS is
+> already sourced.
 
 ### CLI flags
 

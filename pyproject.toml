@@ -1,0 +1,7 @@
+[build-system]
+# PEP 517 build backend. Kept minimal so the project also builds with the
+# older setuptools shipped by ROS 2 Humble images (>=42 works; setup.cfg holds
+# the metadata). Requires network only when pip uses build isolation; add
+# --no-build-isolation to build fully offline with the system setuptools.
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
