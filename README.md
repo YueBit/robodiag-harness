@@ -97,7 +97,7 @@ The workspace should already be built, with an `install/setup.bash` file.
 ### 4. Start with a check
 
 Begin with status checks and telemetry inspection. Review the available data
-before running actions that move the robot.
+before acting on a conclusion.
 
 Missing data does not necessarily mean broken hardware: the relevant sensor,
 driver, or ROS 2 node may not be running.
@@ -126,22 +126,10 @@ A typical workflow is:
 1. You describe the problem.
 2. The assistant requests relevant robot data.
 3. It reviews the results and suggests further checks.
-4. You decide whether to proceed with any physical tests.
+4. You decide whether to act on its suggestions.
 
 **AI suggestions can be wrong.** Check the underlying readings before acting on
 a conclusion.
-
-## Before running movement tests
-
-Some actions can move real hardware.
-
-- Place the robot in a clear, stable area.
-- Keep people and obstacles away from moving parts.
-- Know how to stop your robot independently of RoboDiag.
-- Review the requested action before confirming it.
-
-A software stop command depends on the robot's implementation and communication
-connection. It does **not** replace a physical emergency stop.
 
 ## Limitations
 
@@ -295,9 +283,9 @@ fed back as structured JSON, and the final answer follows a fixed shape:
 | Read-only | `check_motion_safety` | Run the deterministic Safety Gate |
 | **Emergency** | `emergency_stop` | Software stop: zero Twist + optional Trigger service. **Never blocked.** |
 
-v0.1 contains no write or motion tool, so there is nothing to confirm. When
-motion extensions land, the Safety Gate and an explicit operator confirmation
-will gate them.
+v0.1 provides read-only diagnostic tests and a software stop command. It does
+not initiate motion. See [Motion extensions (future)](#motion-extensions-future)
+for the plan for motion and write actions.
 
 ### Configuration
 
@@ -359,6 +347,22 @@ Every run is written to SQLite and can be inspected with `/history` or the
    "No data" is never treated as "normal".
 3. **Structured results.** Evidence and tests are first-class objects
    (`Evidence`, `TestResult`), not free-form strings.
+
+## Motion extensions (future)
+
+v0.1 provides read-only diagnostic tests and a software stop command. It does
+not initiate motion.
+
+Future versions may add motion tests and other write actions. When they land:
+
+- The Safety Gate and an explicit operator confirmation will gate them.
+- Place the robot in a clear, stable area and keep people and obstacles away
+  from moving parts before any movement test.
+- Know how to stop your robot independently of RoboDiag.
+- Review the requested action before confirming it.
+
+A software stop command depends on the robot's implementation and communication
+connection. It does **not** replace a physical emergency stop.
 
 ## Contributing
 
