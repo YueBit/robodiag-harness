@@ -6,7 +6,7 @@
 ![ROS 2](https://img.shields.io/badge/ROS%202-Humble-22314E)
 ![Python](https://img.shields.io/badge/Python-3.10-blue)
 
-![RoboDiag Harness terminal](assets/robodiag.jpg)
+![RoboDiag Harness terminal](assets/robodiag.webp)
 
 Your robot is connected—but is it working properly? Is sensor data arriving?
 Are there any reported faults? What should you check when something goes wrong?
