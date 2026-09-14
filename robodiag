@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# RoboDiag ROS 2 Diagnostic Harness — generic launcher
+#
+# Sources the ROS 2 environment (and an optional workspace overlay), then starts
+# the harness. Any arguments are forwarded to robodiag_ros2.py.
+#
+# Examples:
+#   ./robodiag
+#   ./robodiag --cmd-vel-topic /cmd_vel --estop-service /emergency_stop
+#   ROBODIAG_WS=~/robot_ws ./robodiag
+set -e
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Locate a ROS 2 environment.
+if [ -n "${ROS_DISTRO:-}" ] && [ -f "/opt/ros/${ROS_DISTRO}/setup.bash" ]; then
+    # shellcheck disable=SC1090
+    . "/opt/ros/${ROS_DISTRO}/setup.bash"
+elif [ -f /opt/ros/humble/setup.bash ]; then
+    # shellcheck disable=SC1091
+    . /opt/ros/humble/setup.bash
+else
+    echo "robodiag: could not find a ROS 2 setup.bash under /opt/ros" >&2
+    exit 1
+fi
+
+# Optional robot workspace overlay.
+if [ -n "${ROBODIAG_WS:-}" ] && [ -f "${ROBODIAG_WS}/install/setup.bash" ]; then
+    # shellcheck disable=SC1090
+    . "${ROBODIAG_WS}/install/setup.bash"
+fi
+
+exec python3 "$HERE/robodiag_ros2.py" "$@"
