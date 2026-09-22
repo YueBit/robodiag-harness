@@ -163,40 +163,39 @@ configuration.
 ## How it works
 
 ```
-      natural language                         slash commands
-            │                                        │
-            ▼                                        ▼
-   ┌────────────────────────────┐          ┌──────────────────┐
-   │  Jev request router        │          │   REPL (rich)    │
-   │  QUERY / DIAGNOSIS /       │          │  direct dispatch │
-   │  ACTION / CHAT             │          └────────┬─────────┘
-   └──────┬──────────┬──────────┘                   │
-     QUERY│  DIAGNOSIS  │ACTION                     │
-     concise│  Jev next-  │deterministic            │
-     answer │  tool loop  │policy/safety            │
-            │      │      │                         │
-            │      ▼      │        same deterministic tools
-            │  ┌─────────────────┐                    │
-            │  │ LLM explainer   │                    │
-            │  │ symptom +       │                    │
-            │  │ evidence →      │                    │
-            │  │ diagnosis       │                    │
-            │  └────────┬────────┘                    │
-            │           │                             │
-            ▼           ▼                             ▼
-   ┌──────────────────────────────────────────────────────────┐
-   │                 Deterministic tool layer                 │
-   │   HarnessNode (rclpy)  ·  TestRunner  ·  HistoryStore     │
-   └───────────┬───────────────────────┬──────────────────────┘
-               │                       │
-       ROS 2 graph / topics       SQLite test history
-               │
-       ┌───────┴────────┐
-       │  Safety Gate   │  fail-closed, no model in the loop
-       │  diagnostics / │  checks freshness + battery + joints
-       │  battery /     │
-       │  joint states  │
-       └────────────────┘
+                natural language                          slash commands
+                       │                                         │
+                       ▼                                         ▼
+   ┌────────────────────────────────────────┐           ┌─────────────────┐
+   │           Jev request router           │           │   REPL (rich)   │
+   │   QUERY / DIAGNOSIS / ACTION / CHAT    │           │ direct dispatch │
+   └────────┬───────────┬─────────────┬─────┘           └────────┬────────┘
+            │           │             │ same deterministic tools │
+              QUERY       DIAGNOSIS     ACTION                   │
+              concise     Jev next-     deterministic            │
+              answer      tool loop     policy/safety            │
+            │           ▼             │                          │
+            │  ┌─────────────────┐    │                          │
+            │  │  LLM explainer  │    │                          │
+            │  │    symptom +    │    │                          │
+            │  │   evidence →    │    │                          │
+            │  │    diagnosis    │    │                          │
+            │  └────────┬────────┘    │                          │
+            │           │             │                          │
+            ▼           ▼             ▼                          ▼
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │                      Deterministic tool layer                       │
+   │         HarnessNode (rclpy)  ·  TestRunner  ·  HistoryStore         │
+   └────────────┬─────────────────────────────────┬──────────────────────┘
+                │                                 │
+     ROS 2 graph / topics                 SQLite test history
+                │
+          ┌─────┴─────────┐
+          │  Safety Gate  │ fail-closed, no model in the loop
+          │ diagnostics / │ checks freshness + battery + joints
+          │   battery /   │
+          │ joint states  │
+          └───────────────┘
 ```
 
 When `TYPESAFE_API_KEY` is not set, the classic LLM function-calling loop is
