@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RoboDiag ROS 2 Diagnostic Harness v0.1
+RoboDiag ROS 2 Diagnostic Harness v0.2
 ======================================
 
 Target: ROS 2 Humble (Python 3.10), but mostly distro-agnostic.
@@ -16,11 +16,13 @@ Capabilities
 - Emergency stop fallback: publish zero geometry_msgs/Twist to a configurable cmd_vel topic
 - Optional Trigger-based E-stop service
 - Optional DeepSeek/OpenAI-compatible diagnostic Agent with function calling
+- Optional Jev (System One) next-tool router: Jev decides which evidence to
+  collect next, the LLM writes the final diagnosis
 
 Design rule
 -----------
 The LLM may request evidence and tests, but deterministic code decides whether a
-write/motion operation is permitted. The default v0.1 does NOT include any test
+write/motion operation is permitted. The default version does NOT include any test
 that intentionally moves the robot.
 
 Examples
@@ -56,6 +58,7 @@ Environment variables
 
     ROBODIAG_MIN_BATTERY_PCT=0.10
     ROBODIAG_MIN_BATTERY_V=0.0
+    ROBODIAG_MAX_BATTERY_AGE_S=5.0
     ROBODIAG_MAX_DIAG_AGE_S=5.0
     ROBODIAG_MAX_JOINT_STATE_AGE_S=1.0
     ROBODIAG_DB=~/.robodiag_ros2.db
@@ -67,14 +70,48 @@ import argparse
 import json
 import math
 import os
-import sqlite3
+import re
 import sys
 import threading
 import time
-from array import array
-from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Callable
+
+from robodiag_jev import (
+    JEV_ACTIONS,
+    LANGUAGE_NAMES,
+    QUERY_CAPABILITIES,
+    DiagnosticState,
+    Evidence,
+    JevClient,
+    JevDecision,
+    JevError,
+    JevRouter,
+    RequestMode,
+    RequestRoute,
+    RequestRouter,
+    TYPESAFE_DEFAULT_BASE_URL,
+    TYPESAFE_DEFAULT_MODEL,
+    TestResult,
+    ToolCall,
+    detect_language,
+)
+
+from robodiag_core import (
+    DIAG_ERROR,
+    DIAG_OK,
+    DIAG_WARN,
+    HistoryStore,
+    SafetyGate,
+    TEST_CATALOG,
+    TestRunner,
+    _jsonable,
+    _result_ok,
+    build_action_capabilities,
+    compact,
+    now_iso,
+    stats_from_samples,
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # REPL line editing / completion
@@ -128,7 +165,7 @@ except ImportError as exc:
     raise SystemExit(2) from exc
 
 try:
-    from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
+    from diagnostic_msgs.msg import DiagnosticArray
     from geometry_msgs.msg import Twist
     from sensor_msgs.msg import BatteryState, JointState, Imu
     from std_srvs.srv import Trigger
@@ -156,14 +193,8 @@ except ImportError:
     OpenAI = None  # AI remains optional
 
 
-VERSION = "0.1.2"
+VERSION = "0.2.0"
 
-# DiagnosticStatus.level is a `byte` field; on ROS 2 Humble the class constants
-# are `bytes` (b'\x00'..b'\x03'), so use plain ints internally.
-DIAG_OK = 0
-DIAG_WARN = 1
-DIAG_ERROR = 2
-DIAG_STALE = 3
 console = Console()
 
 BANNER = [
@@ -242,40 +273,6 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
-def compact(value: Any, limit: int = 12000) -> str:
-    try:
-        s = json.dumps(value, ensure_ascii=False, allow_nan=False, default=str)
-    except (TypeError, ValueError):
-        s = json.dumps(_jsonable(value), ensure_ascii=False, default=str)
-    if len(s) <= limit:
-        return s
-    return json.dumps(
-        {"ok": True, "truncated": True, "preview": s[: limit - 200]},
-        ensure_ascii=False,
-    )
-
-
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(k): _jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, array)):
-        return [_jsonable(v) for v in value]
-    if hasattr(value, "tolist"):
-        try:
-            return _jsonable(value.tolist())
-        except Exception:
-            pass
-    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
-        return None
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return str(value)
-
-
-def now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
-
-
 def _diag_level(value: Any) -> int:
     """DiagnosticStatus.level is a `byte` field; ROS 2 Humble maps it to bytes."""
     if isinstance(value, (bytes, bytearray)):
@@ -319,136 +316,13 @@ def to_builtin_message(msg: Any) -> dict[str, Any]:
     return raw
 
 
-def flatten_numeric(value: Any, prefix: str = "", max_array_items: int = 64) -> dict[str, float]:
-    """Flatten numeric leaves for statistics; large arrays are intentionally capped."""
-    out: dict[str, float] = {}
-    if isinstance(value, bool):
-        return out
-    if isinstance(value, (int, float)):
-        if math.isfinite(float(value)):
-            out[prefix or "value"] = float(value)
-        return out
-    if isinstance(value, dict):
-        for key, sub in value.items():
-            p = f"{prefix}.{key}" if prefix else str(key)
-            out.update(flatten_numeric(sub, p, max_array_items))
-        return out
-    if isinstance(value, (list, tuple)):
-        for i, sub in enumerate(value[:max_array_items]):
-            p = f"{prefix}[{i}]"
-            out.update(flatten_numeric(sub, p, max_array_items))
-    return out
-
-
-def stats_from_samples(samples: list[dict[str, Any]]) -> dict[str, dict[str, float | int]]:
-    buckets: dict[str, list[float]] = {}
-    for sample in samples:
-        for path, value in flatten_numeric(sample).items():
-            buckets.setdefault(path, []).append(value)
-
-    result: dict[str, dict[str, float | int]] = {}
-    for path, values in buckets.items():
-        if not values:
-            continue
-        mean = sum(values) / len(values)
-        variance = sum((v - mean) ** 2 for v in values) / len(values)
-        result[path] = {
-            "n": len(values),
-            "min": round(min(values), 6),
-            "max": round(max(values), 6),
-            "mean": round(mean, 6),
-            "std": round(math.sqrt(variance), 6),
-            "range": round(max(values) - min(values), 6),
-        }
-    return result
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Evidence / test model
+#
+# Evidence, TestResult, ToolCall and DiagnosticState now live in robodiag_jev.py
+# (imported above) so the diagnostic state model is shared with the router layer
+# and has no ROS or rich dependency.
 # ──────────────────────────────────────────────────────────────────────────────
-@dataclass
-class Evidence:
-    source: str
-    metric: str
-    value: Any
-    timestamp: str
-    quality: str = "measured"
-
-
-@dataclass
-class TestResult:
-    test_id: str
-    result: str  # PASS / WARN / FAIL / SKIP
-    summary: str
-    evidence: list[dict[str, Any]]
-    started_at: str
-    duration_ms: int
-
-    def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# SQLite history
-# ──────────────────────────────────────────────────────────────────────────────
-class HistoryStore:
-    def __init__(self, path: Path):
-        self.path = path.expanduser()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
-        with self._connect() as con:
-            con.execute(
-                """
-                CREATE TABLE IF NOT EXISTS test_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    started_at TEXT NOT NULL,
-                    test_id TEXT NOT NULL,
-                    result TEXT NOT NULL,
-                    summary TEXT NOT NULL,
-                    duration_ms INTEGER NOT NULL,
-                    payload TEXT NOT NULL
-                )
-                """
-            )
-
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(str(self.path), timeout=3.0)
-
-    def add(self, result: TestResult) -> None:
-        with self._lock, self._connect() as con:
-            con.execute(
-                """INSERT INTO test_history
-                   (started_at, test_id, result, summary, duration_ms, payload)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    result.started_at,
-                    result.test_id,
-                    result.result,
-                    result.summary,
-                    result.duration_ms,
-                    json.dumps(result.as_dict(), ensure_ascii=False, default=str),
-                ),
-            )
-
-    def recent(self, limit: int = 10) -> list[dict[str, Any]]:
-        limit = max(1, min(int(limit), 100))
-        with self._lock, self._connect() as con:
-            rows = con.execute(
-                """SELECT id, started_at, test_id, result, summary, duration_ms
-                   FROM test_history ORDER BY id DESC LIMIT ?""",
-                (limit,),
-            ).fetchall()
-        return [
-            {
-                "id": row[0],
-                "started_at": row[1],
-                "test_id": row[2],
-                "result": row[3],
-                "summary": row[4],
-                "duration_ms": row[5],
-            }
-            for row in rows
-        ]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -948,252 +822,6 @@ class HarnessNode(Node):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Safety Gate
-# ──────────────────────────────────────────────────────────────────────────────
-class SafetyGate:
-    def __init__(
-        self,
-        node: HarnessNode,
-        min_battery_pct: float,
-        min_battery_v: float,
-        max_diag_age_s: float,
-        max_joint_age_s: float,
-    ):
-        self.node = node
-        self.min_battery_pct = min_battery_pct
-        self.min_battery_v = min_battery_v
-        self.max_diag_age_s = max_diag_age_s
-        self.max_joint_age_s = max_joint_age_s
-
-    def check_for_motion(self) -> dict[str, Any]:
-        """Fail closed: deny motion unless required evidence is present and healthy.
-
-        Missing evidence (no /diagnostics, battery, or /joint_states) is treated
-        as unsafe, never as "normal". This matches the design principle that
-        "no data" must not permit motion.
-        """
-        checks: list[dict[str, Any]] = []
-        allow = True
-
-        diag = self.node.get_diagnostics(include_ok=False)
-        if diag.get("available"):
-            age = diag.get("last_array_age_s")
-            if age is not None and age > self.max_diag_age_s:
-                allow = False
-                checks.append({"check": "diagnostics_fresh", "ok": False, "reason": f"/diagnostics stale: {age}s"})
-            else:
-                bad = [x for x in diag["statuses"] if x["level"] >= DIAG_ERROR]
-                if bad:
-                    allow = False
-                    checks.append({"check": "diagnostics", "ok": False, "reason": f"critical diagnostic statuses: {len(bad)}", "items": bad[:5]})
-                else:
-                    checks.append({"check": "diagnostics", "ok": True})
-        else:
-            allow = False
-            checks.append({"check": "diagnostics", "ok": False, "reason": "no /diagnostics evidence (missing)"})
-
-        battery = self.node.battery_state()
-        if battery.get("available"):
-            if battery.get("age_s", 999) > 5.0:
-                allow = False
-                checks.append({"check": "battery_fresh", "ok": False, "reason": f"battery state stale: {battery['age_s']}s"})
-            else:
-                pct = battery.get("percentage")
-                voltage = battery.get("voltage")
-                if pct is not None and self.min_battery_pct > 0 and pct < self.min_battery_pct:
-                    allow = False
-                    checks.append({"check": "battery_pct", "ok": False, "reason": f"battery {pct:.1%} < {self.min_battery_pct:.1%}"})
-                elif voltage is not None and self.min_battery_v > 0 and voltage < self.min_battery_v:
-                    allow = False
-                    checks.append({"check": "battery_voltage", "ok": False, "reason": f"battery {voltage:.2f}V < {self.min_battery_v:.2f}V"})
-                else:
-                    checks.append({"check": "battery", "ok": True, "value": battery})
-        else:
-            allow = False
-            checks.append({"check": "battery", "ok": False, "reason": "no BatteryState topic discovered (missing)"})
-
-        joint = self.node.joint_state_cached()
-        if joint.get("available"):
-            if joint.get("age_s", 999) > self.max_joint_age_s:
-                allow = False
-                checks.append({"check": "joint_states_fresh", "ok": False, "reason": f"/joint_states stale: {joint['age_s']}s"})
-            else:
-                checks.append({"check": "joint_states_fresh", "ok": True, "age_s": joint["age_s"]})
-        else:
-            allow = False
-            checks.append({"check": "joint_states", "ok": False, "reason": "no /joint_states evidence (missing)"})
-
-        return {"allow": allow, "checks": checks}
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Deterministic test runner
-# ──────────────────────────────────────────────────────────────────────────────
-TEST_CATALOG = {
-    "graph_health": {
-        "name": "ROS graph health",
-        "description": "Check whether the graph contains useful nodes/topics and core robot signals.",
-        "writes": False,
-    },
-    "diagnostics_health": {
-        "name": "Standard diagnostics health",
-        "description": "Inspect /diagnostics and fail on ERROR/STALE; WARN remains warning.",
-        "writes": False,
-    },
-    "joint_states_health": {
-        "name": "Joint-state stream health",
-        "description": "Sample /joint_states and check freshness, rate, finite values and movement jitter evidence.",
-        "writes": False,
-    },
-    "ros2_control_health": {
-        "name": "ros2_control health",
-        "description": "Inspect controller_manager controllers, hardware components and interfaces when available.",
-        "writes": False,
-    },
-    "system_health": {
-        "name": "Composite system health",
-        "description": "Run graph, diagnostics, joint-state and ros2_control checks and aggregate the result.",
-        "writes": False,
-    },
-}
-
-
-class TestRunner:
-    def __init__(self, node: HarnessNode, history: HistoryStore):
-        self.node = node
-        self.history = history
-
-    @staticmethod
-    def _severity(result: str) -> int:
-        return {"PASS": 0, "SKIP": 1, "WARN": 2, "FAIL": 3}.get(result, 3)
-
-    def run(self, test_id: str) -> dict[str, Any]:
-        if test_id not in TEST_CATALOG:
-            return {"ok": False, "error": f"unknown test_id: {test_id}", "available": list(TEST_CATALOG)}
-
-        started_iso = now_iso()
-        started = time.monotonic()
-        try:
-            method = getattr(self, f"_test_{test_id}")
-            result, summary, evidence = method()
-        except Exception as exc:  # noqa: BLE001
-            result, summary, evidence = (
-                "FAIL",
-                f"test exception: {type(exc).__name__}: {exc}",
-                [],
-            )
-        duration_ms = int((time.monotonic() - started) * 1000)
-        tr = TestResult(
-            test_id=test_id,
-            result=result,
-            summary=summary,
-            evidence=evidence,
-            started_at=started_iso,
-            duration_ms=duration_ms,
-        )
-        self.history.add(tr)
-        return {"ok": result != "FAIL", **tr.as_dict()}
-
-    def _test_graph_health(self) -> tuple[str, str, list[dict[str, Any]]]:
-        g = self.node.inspect_graph()
-        topic_names = {x["name"] for x in g["topics"]}
-        node_count = g["summary"]["nodes"]
-        evidence = [
-            asdict(Evidence("ros_graph", "node_count", node_count, now_iso())),
-            asdict(Evidence("ros_graph", "topic_count", g["summary"]["topics"], now_iso())),
-            asdict(Evidence("ros_graph", "has_joint_states", "/joint_states" in topic_names, now_iso())),
-            asdict(Evidence("ros_graph", "has_diagnostics", "/diagnostics" in topic_names, now_iso())),
-        ]
-        if node_count <= 1:
-            return "FAIL", "Only the harness node is visible; robot graph appears absent.", evidence
-        if "/joint_states" not in topic_names:
-            return "WARN", "ROS graph is alive, but /joint_states was not discovered.", evidence
-        return "PASS", "ROS graph is alive and /joint_states is present.", evidence
-
-    def _test_diagnostics_health(self) -> tuple[str, str, list[dict[str, Any]]]:
-        d = self.node.get_diagnostics(include_ok=True)
-        evidence = [asdict(Evidence("/diagnostics", "summary", d, now_iso()))]
-        if not d["available"]:
-            return "SKIP", "No standard /diagnostics status has been received.", evidence
-        if d["last_array_age_s"] is not None and d["last_array_age_s"] > 5.0:
-            return "FAIL", f"/diagnostics is stale ({d['last_array_age_s']}s).", evidence
-        levels = [x["level"] for x in d["statuses"]]
-        if any(x >= DIAG_ERROR for x in levels):
-            return "FAIL", "At least one diagnostic component is ERROR/STALE.", evidence
-        if any(x == DIAG_WARN for x in levels):
-            return "WARN", "Diagnostics contains warning-level components.", evidence
-        return "PASS", "All received standard diagnostic statuses are OK.", evidence
-
-    def _test_joint_states_health(self) -> tuple[str, str, list[dict[str, Any]]]:
-        s = self.node.sample_topic("/joint_states", duration_s=2.5, rate_hz=10.0)
-        evidence = [asdict(Evidence("/joint_states", "sample", s, now_iso()))]
-        if not s.get("ok"):
-            return "FAIL", s.get("error", "joint state sampling failed"), evidence
-        if s["samples"] < 3:
-            return "WARN", f"Only {s['samples']} joint-state samples were received.", evidence
-        if s["effective_rate_hz"] < 2.0:
-            return "WARN", f"Joint-state effective sample rate is low ({s['effective_rate_hz']} Hz).", evidence
-
-        # Look for non-finite or missing position data in latest sample.
-        last = s.get("last", {})
-        joints = last.get("_joints", {}) if isinstance(last, dict) else {}
-        if not joints:
-            return "WARN", "JointState was received but no named joints were found.", evidence
-        missing = [name for name, val in joints.items() if val.get("position") is None]
-        if missing:
-            return "WARN", f"{len(missing)} joints have no position value.", evidence
-        return "PASS", f"Joint-state stream healthy for {len(joints)} named joints.", evidence
-
-    def _test_ros2_control_health(self) -> tuple[str, str, list[dict[str, Any]]]:
-        c = self.node.inspect_ros2_control()
-        evidence = [asdict(Evidence("ros2_control", "inspection", c, now_iso()))]
-        if not c.get("available"):
-            return "SKIP", c.get("error", "ros2_control controller manager not discovered"), evidence
-
-        controllers = (((c.get("controllers") or {}).get("data") or {}).get("controller") or [])
-        hardware = (((c.get("hardware_components") or {}).get("data") or {}).get("component") or [])
-        active_controllers = [x for x in controllers if str(x.get("state", "")).lower() == "active"]
-
-        bad_hw = []
-        for comp in hardware:
-            state = comp.get("state") or {}
-            label = str(state.get("label", "")).lower()
-            if label and label != "active":
-                bad_hw.append({"name": comp.get("name"), "state": state})
-
-        if bad_hw:
-            return "FAIL", f"{len(bad_hw)} ros2_control hardware component(s) are not active.", evidence
-        if controllers and not active_controllers:
-            return "WARN", "Controllers are loaded but none are active.", evidence
-        return "PASS", f"ros2_control reachable; {len(active_controllers)} active controller(s).", evidence
-
-    def _test_system_health(self) -> tuple[str, str, list[dict[str, Any]]]:
-        sub_ids = [
-            "graph_health",
-            "diagnostics_health",
-            "joint_states_health",
-            "ros2_control_health",
-        ]
-        sub_results = []
-        for sid in sub_ids:
-            # Call sub-test methods directly so composite run creates one DB record,
-            # rather than recursively writing 5 history entries.
-            result, summary, evidence = getattr(self, f"_test_{sid}")()
-            sub_results.append({"test_id": sid, "result": result, "summary": summary, "evidence": evidence})
-
-        worst = max(sub_results, key=lambda x: self._severity(x["result"]))["result"]
-        if worst == "FAIL":
-            overall = "FAIL"
-        elif any(x["result"] == "WARN" for x in sub_results):
-            overall = "WARN"
-        else:
-            overall = "PASS"
-
-        summary = "; ".join(f"{x['test_id']}={x['result']}" for x in sub_results)
-        return overall, summary, sub_results
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # LLM tools / Agent
 # ──────────────────────────────────────────────────────────────────────────────
 TOOLS = [
@@ -1260,7 +888,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "list_tests",
-            "description": "List deterministic RoboDiag test cases. v0.1 tests are read-only and never intentionally move the robot.",
+            "description": "List deterministic RoboDiag test cases. v0.2 tests are read-only and never intentionally move the robot.",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
@@ -1268,7 +896,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "run_test",
-            "description": "Run one deterministic RoboDiag health test by test_id. v0.1 test catalog is read-only.",
+            "description": "Run one deterministic RoboDiag health test by test_id. v0.2 test catalog is read-only.",
             "parameters": {
                 "type": "object",
                 "properties": {"test_id": {"type": "string", "enum": list(TEST_CATALOG.keys())}},
@@ -1315,11 +943,11 @@ Principles:
 1. Gather evidence first, then reason. Do not invent the current hardware state from the robot model or general assumptions.
 2. Prefer standard ROS capabilities: ROS graph, /diagnostics, /joint_states, IMU/Battery topics, ros2_control.
 3. When suspecting jitter/drift/intermittent faults, use sample_topic instead of looking at a single frame only.
-4. Conclusions must distinguish: measured evidence / inferred root cause / still-missing information.
+4. Conclusions must distinguish: measured evidence / inference / still-missing information. Use "suspected" or "likely" for causes; say "confirmed" only when a deterministic test established it.
 5. When a tool returns ok=false or unavailable, explicitly acknowledge that the evidence is unavailable; do not interpret "no data" as "normal".
 6. emergency_stop is a software-level fallback, not a physical E-stop; if dangerous motion is observed you may call it immediately without user confirmation.
-7. v0.1 has no diagnostic test that actively drives joints; do not claim that you made the robot perform a motion test.
-8. Answer in English, organized as: symptom → evidence → root-cause assessment → recommendations. Keep it engineering-focused and concise.
+7. v0.2 has no diagnostic test that actively drives joints; do not claim that you made the robot perform a motion test.
+8. Answer in the same language as the operator (if the language is unclear, reply in English), organized as: symptom → evidence → assessment → possible causes → recommended next checks. Keep it engineering-focused and concise.
 """
 
 
@@ -1428,6 +1056,760 @@ def agent_turn(runtime: AgentRuntime, client: Any, model: str, messages: list[di
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Jev — System One decision router (TypeSafe AI)
+#
+# Jev is not a text-generating LLM. It takes a state (symptom + evidence) and a
+# typed question, and returns a structured decision with calibrated
+# probabilities. RoboDiag uses Jev as the "System 1" router that decides which
+# deterministic tool to run next; once Jev says "finalize", the collected
+# evidence is handed to the LLM (System 2) for the written diagnosis.
+#
+#   Jev decides what to investigate.
+#   Deterministic tools decide what is true.
+#   The LLM explains what it means.
+#   The Safety Gate decides what is allowed.
+#
+# API: POST https://api.typesafe.ai/v1/systemone  (Authorization: Bearer <key>)
+# See https://docs.typesafe.ai/api
+# ──────────────────────────────────────────────────────────────────────────────
+# Topic names Jev is allowed to choose from when a snapshot/sample is needed.
+_JEV_TOPIC_HINTS = (
+    "joint", "imu", "battery", "diagnostic", "cmd_vel", "camera", "scan",
+    "odom", "wheel", "velocity", "position", "status", "effort", "temp",
+    "current", "voltage", "foot", "leg", "motor",
+)
+_JEV_MAX_TOPIC_OPTIONS = 24
+_JEV_MAX_ROUNDS = 8
+_EXPLAINER_EVIDENCE_CHARS = 3000
+
+# Deterministic gates around Jev's routing proposals (see run_jev_diagnosis).
+_JEV_MIN_EVIDENCE_ITEMS = 1   # finalize is withheld until this many successful calls
+_JEV_MAX_CALLS_PER_TOOL = 3   # per-tool budget inside one diagnosis
+_JEV_NONE_TOPIC = "none_of_the_above"  # always offered so Jev is never forced into a bad topic
+
+def _resolve_jev_settings(
+    api_key_override: str | None = None,
+    base_url_override: str | None = None,
+    model_override: str | None = None,
+) -> tuple[str, str, str]:
+    """Resolve Jev settings with the same precedence as the LLM settings:
+    CLI flag > environment variable > ~/.robodiag.env > built-in default."""
+    env_file = load_env(Path.home() / ".robodiag.env")
+    api_key = api_key_override or os.environ.get("TYPESAFE_API_KEY") or env_file.get("TYPESAFE_API_KEY", "")
+    base_url = base_url_override or os.environ.get("TYPESAFE_BASE_URL") or env_file.get("TYPESAFE_BASE_URL", TYPESAFE_DEFAULT_BASE_URL)
+    model = model_override or os.environ.get("TYPESAFE_MODEL") or env_file.get("TYPESAFE_MODEL", TYPESAFE_DEFAULT_MODEL)
+    return api_key, base_url, model
+
+
+def build_jev_router(
+    api_key_override: str | None = None,
+    base_url_override: str | None = None,
+    model_override: str | None = None,
+) -> tuple[JevRouter | None, str]:
+    api_key, base_url, model = _resolve_jev_settings(api_key_override, base_url_override, model_override)
+    if not api_key or "your-api-key" in api_key:
+        return None, model
+    try:
+        return JevRouter(JevClient(api_key=api_key, base_url=base_url, model=model), TEST_CATALOG), model
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[yellow]Jev router initialization failed; disabled: {type(exc).__name__}: {exc}[/yellow]")
+        return None, model
+
+
+def build_request_router(
+    api_key_override: str | None = None,
+    base_url_override: str | None = None,
+    model_override: str | None = None,
+) -> tuple[RequestRouter | None, str]:
+    api_key, base_url, model = _resolve_jev_settings(api_key_override, base_url_override, model_override)
+    if not api_key or "your-api-key" in api_key:
+        return None, model
+    try:
+        client = JevClient(api_key=api_key, base_url=base_url, model=model)
+        router = RequestRouter(client, QUERY_CAPABILITIES, build_action_capabilities())
+        return router, model
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[yellow]Request router initialization failed; disabled: {type(exc).__name__}: {exc}[/yellow]")
+        return None, model
+
+
+EXPLAINER_SYSTEM_PROMPT = f"""You are the RoboDiag ROS 2 Diagnostic Agent v{VERSION} explainer (System 2).
+
+The evidence-gathering phase is complete. You receive the operator's symptom
+and the structured evidence already collected by deterministic tools. Do not
+request more tools.
+
+Write the final diagnosis with this exact structure:
+1. Symptom — restate the reported problem.
+2. Evidence — the measured findings that matter, each attributed to its source.
+3. Assessment — what the evidence directly shows, separating measured facts
+   from inference.
+4. Possible causes — ranked suspected/likely causes. Use "suspected" or
+   "likely"; never claim a "root cause" unless a deterministic test has
+   explicitly confirmed it.
+5. Confirmed findings — only facts established by a deterministic test result.
+   If there are none, say so explicitly.
+6. Recommended next checks — concrete, ordered steps to confirm or rule out the
+   suspected causes.
+
+Rules:
+- Never invent evidence that is not in the provided records.
+- If the evidence is insufficient, say exactly what is still missing.
+- Keep it engineering-focused and concise. Reply in the same language as the
+  operator's symptom; if the language is unclear, reply in English.
+"""
+
+
+def explain_with_llm(client: Any, model: str, state: DiagnosticState, lang: str = "en") -> str:
+    payload = {
+        "symptom": state.symptom,
+        "language": lang,
+        "tool_calls": [
+            {"tool": tc.tool, "args": tc.args, "result": tc.result[:_EXPLAINER_EVIDENCE_CHARS]}
+            for tc in state.tool_calls
+        ],
+        "test_results": [tr.as_dict() for tr in state.test_results],
+        "graph_summary": state.graph_summary,
+    }
+    user = (
+        "Diagnose the following. The symptom and the collected evidence are "
+        "provided as JSON below.\n\n"
+        f"Reply in the same language as the operator's symptom (detected: "
+        f"{LANGUAGE_NAMES.get(lang, 'English')}). If the language is unclear, "
+        "reply in English.\n\n"
+        + json.dumps(payload, ensure_ascii=False, default=str)
+    )
+    with console.status("[bold #7C4DFF]Writing diagnosis…", spinner="dots"):
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": EXPLAINER_SYSTEM_PROMPT},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.3,
+        )
+    return resp.choices[0].message.content or ""
+
+
+def _print_jev_decision(label: str, decision: JevDecision) -> None:
+    top = sorted(decision.probabilities.items(), key=lambda kv: kv[1], reverse=True)[:3]
+    bits = " · ".join(f"{k} {v:.0%}" for k, v in top)
+    console.print(
+        Text(f"  🧠 Jev {label}: ", style="bold #B388FF")
+        .append(decision.action, style="bold #00E5FF")
+        .append(f"   (conf {decision.confidence:.2f} · {decision.model})", style="dim")
+    )
+    console.print(Text(f"      {bits}", style="dim"))
+
+
+def _safe_jev_decision(label: str, method: Any, *args: Any) -> JevDecision | None:
+    try:
+        return method(*args)
+    except JevError as exc:
+        console.print(f"[red]Jev {label} failed: {exc}[/red]")
+        return None
+
+
+_JEV_PREFERRED_TYPES = (
+    "sensor_msgs/msg/JointState",
+    "sensor_msgs/msg/Imu",
+    "sensor_msgs/msg/BatteryState",
+    "diagnostic_msgs/msg/DiagnosticArray",
+    "geometry_msgs/msg/Twist",
+    "geometry_msgs/msg/PoseStamped",
+    "nav_msgs/msg/Odometry",
+)
+
+
+def _jev_topic_candidates(node: HarnessNode, state: DiagnosticState) -> list[str]:
+    """Deterministic pre-filter before the Jev Choice.
+
+    Jev only sees a shortlist (≤ _JEV_MAX_TOPIC_OPTIONS) that has already been
+    ranked by deterministic rules: known diagnostic names, message type, symptom
+    keyword overlap, and topics already sampled in the evidence. The caller
+    always appends NONE_OF_THE_ABOVE so Jev is never forced to pick a bad topic.
+    """
+    graph = node.inspect_graph()
+    state.graph_summary = graph.get("summary")
+    rows = [
+        (t.get("name", ""), t.get("types", []))
+        for t in graph.get("topics", [])
+        if t.get("name")
+    ]
+    symptom_tokens = set(re.findall(r"[a-z0-9_]+", state.symptom.lower()))
+    already_sampled = {
+        tc.args.get("topic")
+        for tc in state.tool_calls
+        if tc.tool in ("sample_topic", "get_topic_snapshot") and tc.args.get("topic")
+    }
+
+    def score(name: str, types: list[str]) -> int:
+        low = name.lower()
+        s = 0
+        if any(hint in low for hint in _JEV_TOPIC_HINTS):
+            s -= 4
+        if any(t in _JEV_PREFERRED_TYPES for t in types):
+            s -= 3
+        s -= 2 * sum(1 for tok in symptom_tokens if tok in low)
+        if name in already_sampled:
+            s += 2  # deprioritize re-sampling the same topic
+        return s
+
+    rows.sort(key=lambda row: (score(row[0], row[1]), row[0]))
+    return [name for name, _ in rows[:_JEV_MAX_TOPIC_OPTIONS]]
+
+
+def _record_test_result(state: DiagnosticState, result: str) -> None:
+    """Fold a run_test result into the diagnostic state as structured data."""
+    try:
+        data = json.loads(result)
+    except (ValueError, TypeError):
+        return
+    if not isinstance(data, dict) or "test_id" not in data:
+        return
+    fields = {
+        key: data.get(key)
+        for key in ("test_id", "result", "summary", "evidence", "started_at", "duration_ms")
+    }
+    if fields["result"] is None:
+        return
+    fields["evidence"] = fields["evidence"] or []
+    tr = TestResult(**fields)
+    state.test_results.append(tr)
+    for ev in tr.evidence:
+        if isinstance(ev, dict):
+            try:
+                state.evidence.append(Evidence(**ev))
+            except TypeError:
+                pass
+
+
+def run_jev_diagnosis(
+    runtime: AgentRuntime,
+    router: JevRouter,
+    llm_client: Any,
+    model: str,
+    symptom: str,
+    lang: str = "en",
+) -> None:
+    """System 1 routing loop with deterministic gates.
+
+    Jev proposes the next action (and whether to finalize), but deterministic
+    code decides what is allowed:
+
+    - finalize is withheld until ≥ _JEV_MIN_EVIDENCE_ITEMS successful tool calls;
+    - an exact (tool, canonical args) repeat is excluded so Jev picks another tool;
+    - each tool has a per-tool call budget; an exhausted tool is excluded, not fatal;
+    - the whole loop is bounded by _JEV_MAX_ROUNDS.
+
+    All state lives in a DiagnosticState, so the loop itself does not care which
+    router produced each decision.
+    """
+    state = DiagnosticState(symptom=symptom)
+    seen: set[tuple[str, str]] = set()
+    tool_counts: dict[str, int] = {}
+    exhausted: set[str] = set()  # tools whose budget is spent or whose exact call repeated
+    topic_candidates: list[str] | None = None
+    finalized = False
+
+    for _round in range(_JEV_MAX_ROUNDS):
+        state.step = _round + 1
+        meaningful_calls = sum(1 for tc in state.tool_calls if tc.ok)
+        allow_finalize = meaningful_calls >= _JEV_MIN_EVIDENCE_ITEMS
+        if not allow_finalize:
+            console.print(
+                Text(
+                    f"  🔒 finalize gated: need ≥{_JEV_MIN_EVIDENCE_ITEMS} successful "
+                    f"evidence call(s), have {meaningful_calls}",
+                    style="dim",
+                )
+            )
+
+        available = {a for a in JEV_ACTIONS if a != "finalize" and a not in exhausted}
+        if not available:
+            if allow_finalize:
+                console.print("[yellow]All evidence tools are exhausted; finalizing.[/yellow]")
+                finalized = True
+            else:
+                console.print("[yellow]All evidence tools are exhausted, but finalize is still gated; stopping.[/yellow]")
+            break
+
+        decision = _safe_jev_decision("next-action", router.next_action, state, allow_finalize, exhausted)
+        if decision is None:
+            break
+        action = decision.action
+        _print_jev_decision("next action", decision)
+
+        if action == "finalize":
+            # Defensive: the gate already removed finalize when evidence is
+            # insufficient, so this should not happen; ignore if it does.
+            if not allow_finalize:
+                console.print("[yellow]Jev proposed finalize while gated; ignoring.[/yellow]")
+                continue
+            finalized = True
+            break
+        if action not in JEV_ACTIONS:
+            # Whitelist guard: Jev can never reach a tool outside JEV_ACTIONS.
+            console.print(f"[yellow]Jev suggested {action!r}, which is not a routable tool; skipping.[/yellow]")
+            continue
+        if action in exhausted:
+            # Defensive: exhausted tools are removed from Jev's criteria, so this
+            # should not happen; exclude it again and ask Jev to choose another.
+            console.print(f"[yellow]Jev suggested exhausted tool {action!r}; excluding it and retrying.[/yellow]")
+            exhausted.add(action)
+            continue
+
+        args: dict[str, Any] = {}
+        if action == "run_test":
+            sub = _safe_jev_decision("test", router.choose_test_id, state)
+            if sub is None:
+                break
+            _print_jev_decision("test", sub)
+            if sub.action not in TEST_CATALOG or TEST_CATALOG[sub.action].get("writes"):
+                console.print(f"[yellow]Jev suggested test {sub.action!r}, which is not read-only; skipping.[/yellow]")
+                continue
+            args = {"test_id": sub.action}
+        elif action in ("sample_topic", "get_topic_snapshot"):
+            if topic_candidates is None:
+                topic_candidates = _jev_topic_candidates(runtime.node, state)
+            if not topic_candidates:
+                console.print("[yellow]No topics discovered to sample; recording as unavailable evidence.[/yellow]")
+                result = compact({"ok": False, "error": "no topics discovered"})
+                state.tool_calls.append(ToolCall(tool=action, args={}, result=result, ok=False))
+                tool_counts[action] = tool_counts.get(action, 0) + 1
+                continue
+            sub = _safe_jev_decision(
+                "topic",
+                router.choose_topic,
+                state,
+                topic_candidates,
+                {_JEV_NONE_TOPIC: "None of these topics is the right one to sample next."},
+            )
+            if sub is None:
+                break
+            _print_jev_decision("topic", sub)
+            if sub.action == _JEV_NONE_TOPIC:
+                console.print("[yellow]Jev declined all candidate topics; recording as unavailable evidence.[/yellow]")
+                result = compact({"ok": False, "error": "no relevant topic among candidates"})
+                state.tool_calls.append(ToolCall(tool=action, args={}, result=result, ok=False))
+                tool_counts[action] = tool_counts.get(action, 0) + 1
+                continue
+            args = {"topic": sub.action}
+
+        key = (action, json.dumps(args, sort_keys=True, default=str))
+        if key in seen:
+            console.print(f"[yellow]Jev repeated the exact call {action} {args}; excluding {action} so Jev picks another tool.[/yellow]")
+            exhausted.add(action)
+            continue
+        if tool_counts.get(action, 0) >= _JEV_MAX_CALLS_PER_TOOL:
+            console.print(f"[yellow]Tool {action} reached its per-tool budget ({_JEV_MAX_CALLS_PER_TOOL}); excluding it so Jev picks another tool.[/yellow]")
+            exhausted.add(action)
+            continue
+        seen.add(key)
+        tool_counts[action] = tool_counts.get(action, 0) + 1
+
+        with console.status(f"[bold #00E5FF]⚡ {action} {args}", spinner="bouncingBall"):
+            result = runtime.execute(action, args)
+        preview = result if len(result) <= 420 else result[:420] + " …"
+        console.print(Text(f"  ⚡ {action} → {preview}", style="dim"))
+        ok = _result_ok(result)
+        state.tool_calls.append(ToolCall(tool=action, args=args, result=result, ok=ok))
+        if action == "run_test":
+            _record_test_result(state, result)
+
+    if not state.tool_calls and not finalized:
+        console.print("[yellow]No evidence was collected; nothing to explain.[/yellow]")
+        return
+
+    console.print(
+        Panel(
+            Text("Jev: enough evidence — handing off to the LLM explainer", style="bold #B388FF"),
+            border_style="#B388FF",
+            title="System 1 → System 2",
+        )
+    )
+    explanation = explain_with_llm(llm_client, model, state, lang)
+    console.print(
+        Panel(
+            Markdown(explanation or "(empty)"),
+            border_style="#7C4DFF",
+            title=f"[bold]🩺 RoboDiag ROS 2 v{VERSION}[/bold]",
+        )
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# QUERY / ACTION / CHAT handlers
+#
+# QUERY: resolve capability → one minimal deterministic tool call → concise
+# text. These paths deliberately never call run_jev_diagnosis() or the LLM
+# explainer, so a simple question stays cheap and fast.
+# ──────────────────────────────────────────────────────────────────────────────
+_TOPIC_RE = re.compile(r"/(?:[A-Za-z0-9_]+/)*[A-Za-z0-9_]+")
+
+
+def _extract_topic(text: str, default: str | None = None) -> str | None:
+    match = _TOPIC_RE.search(text)
+    return match.group(0) if match else default
+
+
+_LANG: dict[str, dict[str, str]] = {
+    "en": {
+        "battery_full": "Battery: {pct} ({v} V)",
+        "battery_pct": "Battery: {pct}",
+        "battery_v": "Battery voltage: {v} V",
+        "battery_unavailable": "Battery: unavailable (no BatteryState received)",
+        "diag_no_data": "No /diagnostics data received.",
+        "diag_errors": "{n} ERROR/STALE status(es):",
+        "diag_warns": "{n} WARN status(es):",
+        "diag_no_errors": "No ERROR statuses reported.",
+        "graph_summary": "ROS graph: {n} nodes · {t} topics · {s} services",
+        "nodes_header": "{n} node(s):",
+        "no_nodes": "No nodes discovered.",
+        "topics_header": "{n} topic(s):",
+        "no_topics": "No topics discovered.",
+        "services_header": "{n} service(s):",
+        "no_services": "No services discovered.",
+        "more": "… and {n} more",
+        "controllers_header": "Controllers:",
+        "no_controllers": "No controllers reported.",
+        "ros2_control_unavailable": "ros2_control unavailable",
+        "joints_header": "Latest /joint_states ({n} joints):",
+        "joints_no_data": "No /joint_states data received.",
+        "joints_no_named": "JointState received but no named joints found.",
+        "joint_pos": "{name}: {pos} rad",
+        "joint_pos_unavailable": "{name}: position unavailable",
+        "js_rate": "/joint_states: {rate} Hz\nSamples: {n} over {d} s",
+        "js_rate_fail": "/joint_states sampling failed",
+        "history_latest": "Latest {test_id}: {result}",
+        "history_run": "Run: {time}",
+        "history_summary": "Summary: {summary}",
+        "no_history": "No test history yet.",
+        "safety_allow": "Safety Gate: ALLOW motion (diagnostics, battery and joint states are fresh).",
+        "safety_deny": "Safety Gate: DENY motion",
+        "prompt_which_topic": "Which topic? Include a topic such as /joint_states in the question.",
+        "chat_fallback": "I can answer robot questions and run diagnostics. Try asking about the battery, topics, controllers, or a symptom you're seeing.",
+    },
+    "zh": {
+        "battery_full": "电量：{pct}（{v} V）",
+        "battery_pct": "电量：{pct}",
+        "battery_v": "电池电压：{v} V",
+        "battery_unavailable": "电量：不可用（未收到 BatteryState）",
+        "diag_no_data": "未收到 /diagnostics 数据。",
+        "diag_errors": "{n} 个 ERROR/STALE 状态：",
+        "diag_warns": "{n} 个 WARN 状态：",
+        "diag_no_errors": "未报告 ERROR 状态。",
+        "graph_summary": "ROS 图：{n} 个节点 · {t} 个话题 · {s} 个服务",
+        "nodes_header": "{n} 个节点：",
+        "no_nodes": "未发现节点。",
+        "topics_header": "{n} 个话题：",
+        "no_topics": "未发现话题。",
+        "services_header": "{n} 个服务：",
+        "no_services": "未发现服务。",
+        "more": "… 还有 {n} 个",
+        "controllers_header": "控制器：",
+        "no_controllers": "未报告控制器。",
+        "ros2_control_unavailable": "ros2_control 不可用",
+        "joints_header": "最新 /joint_states（{n} 个关节）：",
+        "joints_no_data": "未收到 /joint_states 数据。",
+        "joints_no_named": "已收到 JointState，但未发现具名关节。",
+        "joint_pos": "{name}：{pos} rad",
+        "joint_pos_unavailable": "{name}：位置不可用",
+        "js_rate": "/joint_states：{rate} Hz\n样本：{n}，{d} 秒",
+        "js_rate_fail": "/joint_states 采样失败",
+        "history_latest": "最新 {test_id}：{result}",
+        "history_run": "运行时间：{time}",
+        "history_summary": "摘要：{summary}",
+        "no_history": "暂无测试历史。",
+        "safety_allow": "安全门：允许运动（诊断、电量与关节状态均新鲜）。",
+        "safety_deny": "安全门：禁止运动",
+        "prompt_which_topic": "请指定话题，例如 /joint_states。",
+        "chat_fallback": "我可以回答机器人相关问题并运行诊断。你可以询问电量、话题、控制器，或描述你看到的问题。",
+    },
+}
+
+
+def _t(lang: str, key: str, **kwargs: Any) -> str:
+    table = _LANG.get(lang) or _LANG["en"]
+    template = table.get(key) or _LANG["en"].get(key) or key
+    try:
+        return template.format(**kwargs)
+    except (KeyError, IndexError, ValueError):
+        return template
+
+
+def _fmt_battery(state: dict[str, Any], lang: str = "en") -> str:
+    pct = state.get("percentage")
+    voltage = state.get("voltage")
+    if pct is not None and voltage is not None:
+        return _t(lang, "battery_full", pct=f"{pct:.0%}", v=f"{voltage:.1f}")
+    if pct is not None:
+        return _t(lang, "battery_pct", pct=f"{pct:.0%}")
+    if voltage is not None:
+        return _t(lang, "battery_v", v=f"{voltage:.1f}")
+    return _t(lang, "battery_unavailable")
+
+
+def _fmt_diagnostics(d: dict[str, Any], lang: str = "en") -> str:
+    if not d.get("available"):
+        return _t(lang, "diag_no_data")
+    errors = [x for x in d.get("statuses", []) if x["level"] >= DIAG_ERROR]
+    warns = [x for x in d.get("statuses", []) if x["level"] == DIAG_WARN]
+    lines: list[str] = []
+    if errors:
+        lines.append(_t(lang, "diag_errors", n=len(errors)))
+        for x in errors[:5]:
+            lines.append(f"- {x['name']}: {x.get('message') or ''}")
+        if warns:
+            lines.append(_t(lang, "diag_warns", n=len(warns)))
+            for x in warns[:5]:
+                lines.append(f"- {x['name']}: {x.get('message') or ''}")
+    elif warns:
+        lines.append(_t(lang, "diag_no_errors"))
+        lines.append(_t(lang, "diag_warns", n=len(warns)))
+        for x in warns[:5]:
+            lines.append(f"- {x['name']}: {x.get('message') or ''}")
+    else:
+        lines.append(_t(lang, "diag_no_errors"))
+    return "\n".join(lines)
+
+
+def _fmt_graph(g: dict[str, Any], lang: str = "en") -> str:
+    s = g.get("summary", {})
+    return _t(
+        lang,
+        "graph_summary",
+        n=s.get("nodes", 0),
+        t=s.get("topics", 0),
+        s=s.get("services", 0),
+    )
+
+
+def _fmt_nodes(g: dict[str, Any], lang: str = "en") -> str:
+    names = [x["name"] for x in g.get("nodes", [])]
+    if not names:
+        return _t(lang, "no_nodes")
+    out = _t(lang, "nodes_header", n=len(names))
+    for n in names[:25]:
+        out += f"\n- {n}"
+    if len(names) > 25:
+        out += f"\n- {_t(lang, 'more', n=len(names) - 25)}"
+    return out
+
+
+def _fmt_topics(g: dict[str, Any], lang: str = "en") -> str:
+    rows = g.get("topics", [])
+    if not rows:
+        return _t(lang, "no_topics")
+    out = _t(lang, "topics_header", n=len(rows))
+    for t in rows[:25]:
+        out += f"\n- {t['name']} [{', '.join(t.get('types', []))}]"
+    if len(rows) > 25:
+        out += f"\n- {_t(lang, 'more', n=len(rows) - 25)}"
+    return out
+
+
+def _fmt_services(g: dict[str, Any], lang: str = "en") -> str:
+    rows = g.get("services", [])
+    if not rows:
+        return _t(lang, "no_services")
+    out = _t(lang, "services_header", n=len(rows))
+    for t in rows[:25]:
+        out += f"\n- {t['name']} [{', '.join(t.get('types', []))}]"
+    if len(rows) > 25:
+        out += f"\n- {_t(lang, 'more', n=len(rows) - 25)}"
+    return out
+
+
+def _fmt_controllers(c: dict[str, Any], lang: str = "en") -> str:
+    if not c.get("available"):
+        return c.get("error") or _t(lang, "ros2_control_unavailable")
+    controllers = (((c.get("controllers") or {}).get("data") or {}).get("controller") or [])
+    if not controllers:
+        return _t(lang, "no_controllers")
+    out = _t(lang, "controllers_header")
+    for x in controllers[:25]:
+        out += f"\n- {x.get('name')} [{x.get('state', 'unknown')}]"
+    return out
+
+
+def _fmt_joint_states(js: dict[str, Any], lang: str = "en") -> str:
+    if not js.get("available"):
+        return _t(lang, "joints_no_data")
+    msg = js.get("message") or {}
+    joints = msg.get("_joints") or {}
+    if not joints:
+        return _t(lang, "joints_no_named")
+    out = _t(lang, "joints_header", n=len(joints))
+    for name, v in joints.items():
+        pos = v.get("position")
+        if pos is not None:
+            out += f"\n- {_t(lang, 'joint_pos', name=name, pos=f'{pos:.3f}')}"
+        else:
+            out += f"\n- {_t(lang, 'joint_pos_unavailable', name=name)}"
+    return out
+
+
+def _fmt_joint_state_rate(s: dict[str, Any], lang: str = "en") -> str:
+    if not s.get("ok"):
+        return s.get("error") or _t(lang, "js_rate_fail")
+    return _t(
+        lang,
+        "js_rate",
+        rate=f"{s.get('effective_rate_hz', 0):.1f}",
+        n=s.get("samples", 0),
+        d=f"{s.get('duration_s', 0):.1f}",
+    )
+
+
+def _fmt_history(rows: list[dict[str, Any]], lang: str = "en") -> str:
+    if not rows:
+        return _t(lang, "no_history")
+    latest = rows[0]
+    lines = [_t(lang, "history_latest", test_id=latest["test_id"], result=latest["result"])]
+    lines.append(_t(lang, "history_run", time=latest["started_at"]))
+    lines.append(_t(lang, "history_summary", summary=latest["summary"]))
+    return "\n".join(lines)
+
+
+def _fmt_safety(s: dict[str, Any], lang: str = "en") -> str:
+    if s.get("allow"):
+        return _t(lang, "safety_allow")
+    lines = [_t(lang, "safety_deny")]
+    for c in [c for c in s.get("checks", []) if not c.get("ok")][:8]:
+        lines.append(f"- {c.get('check')}: {c.get('reason', 'failed')}")
+    return "\n".join(lines)
+
+
+def handle_query(
+    route: RequestRoute,
+    text: str,
+    node: HarnessNode,
+    history_store: HistoryStore,
+    gate: SafetyGate,
+    lang: str = "en",
+) -> bool:
+    """Handle a QUERY route with one minimal deterministic tool call.
+
+    Returns True when handled; False when the caller should fall back (for
+    example, an unknown capability string).
+    """
+    capability = route.capability
+    if capability not in QUERY_CAPABILITIES:
+        return False
+    spec = QUERY_CAPABILITIES[capability]
+    tool = spec.tool
+
+    if tool == "battery_state":
+        console.print(_fmt_battery(node.battery_state(), lang))
+    elif tool == "get_diagnostics":
+        console.print(_fmt_diagnostics(node.get_diagnostics(include_ok=False), lang))
+    elif tool == "inspect_graph":
+        g = node.inspect_graph()
+        if capability == "nodes":
+            console.print(_fmt_nodes(g, lang))
+        elif capability == "topics":
+            console.print(_fmt_topics(g, lang))
+        elif capability == "services":
+            console.print(_fmt_services(g, lang))
+        else:
+            console.print(_fmt_graph(g, lang))
+    elif tool == "inspect_ros2_control":
+        console.print(_fmt_controllers(node.inspect_ros2_control(), lang))
+    elif tool == "joint_state_cached":
+        console.print(_fmt_joint_states(node.joint_state_cached(), lang))
+    elif tool == "sample_topic":
+        if capability == "joint_state_rate":
+            with console.status("[bold #00E5FF]Sampling /joint_states…[/bold #00E5FF]"):
+                s = node.sample_topic("/joint_states", duration_s=2.0, rate_hz=50.0)
+            console.print(_fmt_joint_state_rate(s, lang))
+        else:  # topic_statistics
+            topic = _extract_topic(text)
+            if not topic:
+                console.print(f"[yellow]{_t(lang, 'prompt_which_topic')}[/yellow]")
+                return True
+            with console.status(f"[bold #00E5FF]Sampling {topic}…[/bold #00E5FF]"):
+                s = node.sample_topic(topic)
+            print_sample(s)
+    elif tool == "topic_snapshot":
+        topic = _extract_topic(text)
+        if not topic:
+            console.print(f"[yellow]{_t(lang, 'prompt_which_topic')}[/yellow]")
+            return True
+        with console.status(f"[bold #00E5FF]Waiting for {topic}…[/bold #00E5FF]"):
+            result = node.topic_snapshot(topic)
+        console.print_json(json.dumps(result, ensure_ascii=False, default=str))
+    elif tool == "query_history":
+        console.print(_fmt_history(history_store.recent(10), lang))
+    elif tool == "check_motion_safety":
+        console.print(_fmt_safety(gate.check_for_motion(), lang))
+    else:
+        return False
+    return True
+
+
+def handle_action(
+    route: RequestRoute,
+    node: HarnessNode,
+    runner: TestRunner,
+) -> bool:
+    """Execute an ACTION route under deterministic policy.
+
+    Only read-only tests and the software emergency stop are supported today.
+    The AI only names the action; deterministic code validates it against the
+    registry and the read-only test catalog before anything runs.
+    """
+    action = route.capability or ""
+    if action.startswith("run_test:"):
+        test_id = action.split(":", 1)[1]
+        if test_id not in TEST_CATALOG or TEST_CATALOG[test_id].get("writes"):
+            console.print(f"[yellow]Action {action!r} is not a permitted read-only test.[/yellow]")
+            return True
+        with console.status(f"[bold #00E5FF]Running {test_id}…[/bold #00E5FF]"):
+            result = runner.run(test_id)
+        if result.get("error"):
+            console.print(f"[red]{result['error']}[/red]")
+        else:
+            print_test(result)
+        return True
+    if action == "emergency_stop":
+        result = node.emergency_stop()
+        console.print_json(json.dumps(result, ensure_ascii=False, default=str))
+        return True
+    return False
+
+
+def handle_chat(llm_client: Any | None, model: str, text: str, lang: str = "en") -> None:
+    """Lightweight CHAT: no tools, no telemetry. Uses the LLM only when available."""
+    if llm_client is None:
+        console.print(_t(lang, "chat_fallback"))
+        return
+    language_hint = LANGUAGE_NAMES.get(lang)
+    system = (
+        "You are a concise robot assistant. Reply in the same language as the "
+        "user; if the user's language is unclear, reply in English. "
+        "Keep answers short and do not invent telemetry."
+    )
+    if language_hint and lang != "en":
+        system += f" The user's message appears to be in {language_hint}."
+    with console.status("[bold #7C4DFF]Thinking…[/bold #7C4DFF]"):
+        try:
+            resp = llm_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0.4,
+            )
+            content = resp.choices[0].message.content or ""
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]Chat failed: {type(exc).__name__}: {exc}[/red]")
+            return
+    console.print(content)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # CLI rendering
 # ──────────────────────────────────────────────────────────────────────────────
 HELP = f"""[bold]RoboDiag ROS 2 Harness v{VERSION}[/bold]
@@ -1439,14 +1821,23 @@ HELP = f"""[bold]RoboDiag ROS 2 Harness v{VERSION}[/bold]
   /topic <topic>                 Snapshot one message from a topic
   /sample <topic> \[sec] \[Hz]   Sample a topic over time and compute statistics
   /tests                         Test catalog
-  /run <test_id>                 Run a deterministic test (all read-only in v0.1)
+  /run <test_id>                 Run a deterministic test (all read-only in v0.2)
   /history \[n]                  Recent n test runs
   /safety                        Show the motion Safety Gate
   /stop                          Software stop: zero cmd_vel + optional Trigger service
+  /jev                           Show Jev (System 1) routing status
   /help                          Help
   /quit                          Quit
 
-Any other input → AI Diagnostic Agent (requires DEEPSEEK_API_KEY).
+Any other input is routed by Jev (System 1) first:
+  QUERY     → one deterministic lookup → concise answer
+  DIAGNOSIS → Jev evidence loop → LLM explanation
+  ACTION    → deterministic read-only test / software stop
+  CHAT      → lightweight reply (no tools)
+
+Diagnosis requires TYPESAFE_API_KEY + DEEPSEEK_API_KEY. Simple queries and
+actions work with only TYPESAFE_API_KEY. With only DEEPSEEK_API_KEY set, the
+classic LLM function-calling agent is used.
 """
 
 # Slash commands offered by the completion menu (name, description).
@@ -1463,6 +1854,7 @@ REPL_COMMANDS: list[tuple[str, str]] = [
     ("/history", "Recent test runs"),
     ("/safety", "Show the motion Safety Gate"),
     ("/stop", "Software stop (zero cmd_vel + optional Trigger)"),
+    ("/jev", "Show Jev (System 1) routing status"),
     ("/quit", "Quit"),
 ]
 
@@ -1655,6 +2047,8 @@ def repl(
     runtime: AgentRuntime,
     llm_client: Any | None,
     model: str,
+    jev_router: JevRouter | None,
+    request_router: RequestRouter | None,
 ) -> None:
     chat_history: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
     console.print(HELP)
@@ -1764,14 +2158,77 @@ def repl(
                     result = node.emergency_stop()
                     console.print_json(json.dumps(result, ensure_ascii=False, default=str))
                 continue
+            if line == "/jev":
+                if jev_router is not None and request_router is not None:
+                    console.print(
+                        f"[bold]Jev request router:[/bold] [bold #00E5FF]{request_router.model}[/bold #00E5FF] "
+                        "— classifies QUERY / DIAGNOSIS / ACTION / CHAT (TypeSafe)."
+                    )
+                    console.print(
+                        f"[bold]Jev diagnostic router:[/bold] [bold #00E5FF]{jev_router.model}[/bold #00E5FF] "
+                        "— next-tool routing inside DIAGNOSIS. "
+                        "It only routes read-only evidence tools; emergency_stop stays behind /stop."
+                    )
+                elif jev_router is not None:
+                    console.print(
+                        f"[bold]Jev router:[/bold] [bold #00E5FF]{jev_router.model}[/bold #00E5FF] "
+                        "— System 1 next-tool routing (TypeSafe). "
+                        "It only routes read-only evidence tools; emergency_stop stays behind /stop."
+                    )
+                else:
+                    console.print("[yellow]Jev router disabled. Set TYPESAFE_API_KEY to enable System 1 routing.[/yellow]")
+                continue
             if line.startswith("/"):
                 console.print(f"[red]Unknown command {line}; type /help for help.[/red]")
                 continue
 
+            lang = detect_language(line)
+
+            if request_router is not None:
+                try:
+                    route = request_router.route(line)
+                except JevError as exc:
+                    console.print(f"[red]Jev request routing failed: {exc}[/red]")
+                    continue
+
+                if route.mode is RequestMode.QUERY:
+                    if handle_query(route, line, node, history_store, gate, lang=lang):
+                        continue
+                    console.print("[yellow]Query capability unresolved; falling back to diagnosis.[/yellow]")
+                    route = RequestRoute(mode=RequestMode.DIAGNOSIS)
+
+                if route.mode is RequestMode.ACTION:
+                    if handle_action(route, node, runner):
+                        continue
+                    console.print("[yellow]Action unresolved; falling back to diagnosis.[/yellow]")
+                    route = RequestRoute(mode=RequestMode.DIAGNOSIS)
+
+                if route.mode is RequestMode.CHAT:
+                    handle_chat(llm_client, model, line, lang=lang)
+                    continue
+
+                # DIAGNOSIS — the existing Jev evidence loop + LLM explainer.
+                if jev_router is None:
+                    if llm_client is None:
+                        console.print("[red]AI Agent not configured. Set DEEPSEEK_API_KEY to enable natural-language diagnosis.[/red]")
+                        continue
+                    chat_history = agent_turn(
+                        runtime,
+                        llm_client,
+                        model,
+                        chat_history + [{"role": "user", "content": line}],
+                    )
+                    continue
+                if llm_client is None:
+                    console.print("[red]Jev router is on, but the LLM explainer is not. Set DEEPSEEK_API_KEY to enable the final diagnosis.[/red]")
+                    continue
+                run_jev_diagnosis(runtime, jev_router, llm_client, model, line, lang=lang)
+                continue
+
+            # No Jev request router: preserve the classic LLM function-calling agent.
             if llm_client is None:
                 console.print("[red]AI Agent not configured. Set DEEPSEEK_API_KEY to enable natural-language diagnosis.[/red]")
                 continue
-
             chat_history = agent_turn(
                 runtime,
                 llm_client,
@@ -1824,6 +2281,10 @@ def main(argv: list[str] | None = None) -> int:
         help="LLM API key; overrides DEEPSEEK_API_KEY (WARNING: visible in `ps` and shell history)",
     )
     parser.add_argument("--api-key-file", default="", help="read the API key from a file (safer than --api-key)")
+    parser.add_argument("--jev-model", default="", help="Jev model name; overrides TYPESAFE_MODEL")
+    parser.add_argument("--jev-base-url", default="", help="TypeSafe base URL; overrides TYPESAFE_BASE_URL")
+    parser.add_argument("--jev-api-key", default="", help="TypeSafe API key; overrides TYPESAFE_API_KEY (visible in `ps`/shell history)")
+    parser.add_argument("--jev-api-key-file", default="", help="read the TypeSafe API key from a file (safer than --jev-api-key)")
     args, ros_unknown = parser.parse_known_args(argv)
 
     play_banner()
@@ -1855,8 +2316,13 @@ def main(argv: list[str] | None = None) -> int:
         min_battery_v=env_float("ROBODIAG_MIN_BATTERY_V", 0.0),
         max_diag_age_s=env_float("ROBODIAG_MAX_DIAG_AGE_S", 5.0),
         max_joint_age_s=env_float("ROBODIAG_MAX_JOINT_STATE_AGE_S", 1.0),
+        max_battery_age_s=env_float("ROBODIAG_MAX_BATTERY_AGE_S", 5.0),
     )
-    runner = TestRunner(node, history_store)
+    runner = TestRunner(
+        node,
+        history_store,
+        max_diag_age_s=env_float("ROBODIAG_MAX_DIAG_AGE_S", 5.0),
+    )
     runtime = AgentRuntime(node, runner, history_store, gate)
 
     cli_api_key = args.api_key
@@ -1877,6 +2343,29 @@ def main(argv: list[str] | None = None) -> int:
         model_override=args.model or None,
     )
 
+    jev_api_key = args.jev_api_key
+    if not jev_api_key and args.jev_api_key_file:
+        try:
+            jev_api_key = Path(args.jev_api_key_file).expanduser().read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            print(f"robodiag: cannot read --jev-api-key-file: {exc}", file=sys.stderr)
+            return 2
+    if args.jev_api_key:
+        console.print(
+            "[yellow]Warning: --jev-api-key is visible in `ps` and shell history; "
+            "prefer TYPESAFE_API_KEY or --jev-api-key-file.[/yellow]"
+        )
+    jev_router, _jev_model = build_jev_router(
+        api_key_override=jev_api_key or None,
+        base_url_override=args.jev_base_url or None,
+        model_override=args.jev_model or None,
+    )
+    request_router, _request_model = build_request_router(
+        api_key_override=jev_api_key or None,
+        base_url_override=args.jev_base_url or None,
+        model_override=args.jev_model or None,
+    )
+
     graph = node.inspect_graph()
     console.print(
         f"  ✅ ROS graph: [bold]{graph['summary']['nodes']}[/bold] nodes · "
@@ -1891,10 +2380,21 @@ def main(argv: list[str] | None = None) -> int:
         if llm_client
         else "  🤖 Agent: [yellow]disabled (DEEPSEEK_API_KEY not found)[/yellow]"
     )
+    if request_router:
+        console.print(
+            f"  🧠 Jev request router: [bold #00E5FF]{_request_model}[/bold #00E5FF] (QUERY/DIAGNOSIS/ACTION/CHAT)"
+        )
+        console.print(
+            f"  🧠 Jev diagnostic router: [bold #00E5FF]{_jev_model}[/bold #00E5FF] (next-tool routing)"
+        )
+    else:
+        console.print(
+            "  🧠 Jev router: [yellow]disabled (TYPESAFE_API_KEY not found) — falling back to LLM function calling[/yellow]"
+        )
     console.print(f"  🗃  History DB: [dim]{Path(args.db).expanduser()}[/dim]\n")
 
     try:
-        repl(node, runner, history_store, gate, runtime, llm_client, model)
+        repl(node, runner, history_store, gate, runtime, llm_client, model, jev_router, request_router)
     finally:
         try:
             executor.shutdown(timeout_sec=1.0)

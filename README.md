@@ -156,6 +156,8 @@ configuration.
 - A software emergency stop (zero Twist + optional Trigger service).
 - An OpenAI-compatible diagnostic agent (DeepSeek by default) with function
   calling.
+- A Jev (System One) next-tool router: Jev decides which read-only evidence
+  tool to run next, then the LLM writes the final diagnosis.
 - `rich` terminal UI with an animated banner and `/`-command completion.
 
 ## How it works
@@ -164,13 +166,24 @@ configuration.
       natural language                         slash commands
             │                                        │
             ▼                                        ▼
-   ┌──────────────────┐                    ┌──────────────────┐
-   │   Agent loop     │                    │   REPL (rich)    │
-   │  LLM function    │                    │  direct dispatch │
-   │  calling, ≤10    │                    └────────┬─────────┘
-   └────────┬─────────┘                             │
-            │ tool calls                    same deterministic tools
-            ▼                                        ▼
+   ┌────────────────────────────┐          ┌──────────────────┐
+   │  Jev request router        │          │   REPL (rich)    │
+   │  QUERY / DIAGNOSIS /       │          │  direct dispatch │
+   │  ACTION / CHAT             │          └────────┬─────────┘
+   └──────┬──────────┬──────────┘                   │
+     QUERY│  DIAGNOSIS  │ACTION                     │
+     concise│  Jev next-  │deterministic            │
+     answer │  tool loop  │policy/safety            │
+            │      │      │                         │
+            │      ▼      │        same deterministic tools
+            │  ┌─────────────────┐                    │
+            │  │ LLM explainer   │                    │
+            │  │ symptom +       │                    │
+            │  │ evidence →      │                    │
+            │  │ diagnosis       │                    │
+            │  └────────┬────────┘                    │
+            │           │                             │
+            ▼           ▼                             ▼
    ┌──────────────────────────────────────────────────────────┐
    │                 Deterministic tool layer                 │
    │   HarnessNode (rclpy)  ·  TestRunner  ·  HistoryStore     │
@@ -179,14 +192,23 @@ configuration.
        ROS 2 graph / topics       SQLite test history
                │
        ┌───────┴────────┐
-       │  Safety Gate   │  fail-closed, no LLM in the loop
+       │  Safety Gate   │  fail-closed, no model in the loop
        │  diagnostics / │  checks freshness + battery + joints
        │  battery /     │
        │  joint states  │
        └────────────────┘
 ```
 
-The core rule:
+When `TYPESAFE_API_KEY` is not set, the classic LLM function-calling loop is
+used instead of the Jev routing. The division of labour with Jev enabled:
+
+> - **Jev request router classifies the task** (System 1 — QUERY/DIAGNOSIS/ACTION/CHAT).
+> - **Jev diagnostic router decides what to investigate** (System 1, inside DIAGNOSIS).
+> - **Deterministic tools decide what is true** (measured evidence only).
+> - **The LLM explains what it means** (System 2 — written diagnosis).
+> - **The Safety Gate decides what is allowed** (fail-closed, deterministic code).
+
+The core safety rule is unchanged:
 
 > **The LLM may request evidence and tests, but deterministic code decides
 > whether a write or motion operation is permitted.**
@@ -197,6 +219,22 @@ The core rule:
 Harness inspects the **live running graph and robot telemetry**, samples topics
 over time, runs deterministic health tests, stores history, and adds an LLM agent
 that can decide *which* evidence to collect next.
+
+## Project structure
+
+The harness is split into three top-level Python modules plus a launcher, so the
+safety-critical and decision-making pieces stay testable without a running robot.
+
+| File | What it contains | ROS needed? |
+|---|---|---|
+| `robodiag_ros2.py` | Main CLI: the `rclpy` `HarnessNode`, the `rich` REPL, the LLM explainer, and the wiring that connects the tools, the Jev routers and the Safety Gate. | Yes |
+| `robodiag_core.py` | Deterministic core (standard library only): JSON/statistics helpers, the SQLite `HistoryStore`, the read-only `TEST_CATALOG` and `TestRunner`, the fail-closed `SafetyGate`, and the ACTION capability registry. | No |
+| `robodiag_jev.py` | Jev (System One) decision layer (standard library only): the `RequestRouter`, the `DiagnosticState` model, the TypeSafe API client, and the `JevRouter` that picks the next evidence tool. | No |
+| `robodiag` | Bash launcher that sources ROS 2 and your robot workspace, then starts the Python harness. | — |
+
+`robodiag_core.py` and `robodiag_jev.py` import only the Python standard library,
+so the deterministic safety logic and the routing decisions can be unit-tested in
+plain CI without ROS 2, `rich`, or network access.
 
 ## Install with pip
 
@@ -240,14 +278,16 @@ pip install -e ".[all]"
 /topic <topic>                 Snapshot one message from a topic
 /sample <topic> [sec] [Hz]     Sample a topic over time and compute statistics
 /tests                         Test catalog
-/run <test_id>                 Run a deterministic test (all read-only in v0.1)
+/run <test_id>                 Run a deterministic test (all read-only in v0.2)
 /history [n]                   Recent n test runs
 /safety                        Show the motion Safety Gate
 /stop                          Software stop: zero cmd_vel + optional Trigger service
 /help /quit
 ```
 
-Any other input goes to the AI diagnostic agent (requires an API key).
+Any other input is classified by the Jev request router into `QUERY`,
+`DIAGNOSIS`, `ACTION` or `CHAT` (requires `TYPESAFE_API_KEY`; `DIAGNOSIS` also
+requires `DEEPSEEK_API_KEY` for the final explanation).
 
 ### CLI flags
 
@@ -261,12 +301,16 @@ Any other input goes to the AI diagnostic agent (requires an API key).
 | `--base-url` | `https://api.deepseek.com` | OpenAI-compatible base URL |
 | `--api-key` | *(none)* | LLM API key (visible in `ps`/shell history) |
 | `--api-key-file` | *(none)* | read the API key from a file (safer) |
+| `--jev-api-key` | *(none)* | TypeSafe API key (visible in `ps`/shell history) |
+| `--jev-api-key-file` | *(none)* | read the TypeSafe API key from a file (safer) |
+| `--jev-base-url` | `https://api.typesafe.ai` | TypeSafe base URL |
+| `--jev-model` | `jev-latest` | Jev model; overrides `TYPESAFE_MODEL` |
 
 ## AI diagnostic agent
 
 The agent runs a function-calling loop of at most 10 rounds. Each tool result is
 fed back as structured JSON, and the final answer follows a fixed shape:
-**symptom → evidence → root cause → recommendations**.
+**symptom → evidence → assessment → possible causes → recommended next checks**.
 
 ### Tools and risk layers
 
@@ -283,9 +327,10 @@ fed back as structured JSON, and the final answer follows a fixed shape:
 | Read-only | `check_motion_safety` | Run the deterministic Safety Gate |
 | **Emergency** | `emergency_stop` | Software stop: zero Twist + optional Trigger service. **Never blocked.** |
 
-v0.1 provides read-only diagnostic tests and a software stop command. It does
-not initiate motion. See [Motion extensions (future)](#motion-extensions-future)
-for the plan for motion and write actions.
+v0.2 contains no write or motion tool, so there is nothing to confirm. When
+motion extensions land, the Safety Gate and an explicit operator confirmation
+will gate them. See [Motion extensions (future)](#motion-extensions-future)
+for the plan.
 
 ### Configuration
 
@@ -301,6 +346,10 @@ CLI flags  >  environment variables  >  ~/.robodiag.env  >  built-in defaults
 DEEPSEEK_API_KEY=sk-...
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-chat
+
+TYPESAFE_API_KEY=apikey_...
+TYPESAFE_BASE_URL=https://api.typesafe.ai
+TYPESAFE_MODEL=jev-latest
 ```
 
 One-off overrides, including non-DeepSeek providers (any OpenAI-compatible
@@ -314,6 +363,85 @@ endpoint):
 
 > `--api-key` works but is visible in `ps` and shell history. Prefer
 > `DEEPSEEK_API_KEY` in `~/.robodiag.env` (mode `600`) or `--api-key-file`.
+>
+> Jev uses the same precedence: `--jev-*` flags > `TYPESAFE_*` environment
+> variables > `~/.robodiag.env` > built-in defaults.
+
+## Jev System One routing
+
+With `TYPESAFE_API_KEY` set, Jev — TypeSafe's System One model — has two
+separate routing roles:
+
+1. **Request routing** — first classify the operator's input into one of
+   `QUERY`, `DIAGNOSIS`, `ACTION` or `CHAT` (and, for `QUERY`/`ACTION`, resolve
+   the specific capability/action).
+2. **Diagnostic routing** — if (and only if) the input is a `DIAGNOSIS`, decide
+   which evidence/tool to collect next.
+
+```text
+user input → Jev request router
+               ├─ QUERY     → one deterministic lookup → concise answer
+               ├─ DIAGNOSIS → Jev diagnostic loop → LLM explanation
+               ├─ ACTION    → deterministic read-only test / software stop
+               └─ CHAT      → lightweight reply (no tools)
+```
+
+Simple questions such as "what is the battery level?" are answered directly
+(`Battery: 73% (15.6 V)`) without entering the diagnostic loop.
+
+RoboDiag replies in the same language as the operator. The language is detected
+from the script of the input (e.g. `现在电量多少？` → Chinese); when the language
+is unclear (for example Latin-script text), replies default to English.
+
+### Diagnostic routing
+
+Inside a `DIAGNOSIS`, Jev acts as a fast **next-tool router**:
+
+1. Jev receives the symptom and the evidence collected so far.
+2. Jev picks the next read-only diagnostic action (a `Choice` over the tool set).
+3. The deterministic tool runs and its result is appended to the evidence.
+4. When Jev picks `finalize`, the LLM (System 2) writes the final diagnosis:
+   symptom → evidence → assessment → possible causes → recommended next checks.
+
+```text
+symptom → Jev: get_diagnostics → Jev: run_test(joint_states_health)
+        → Jev: sample_topic(/joint_states) → Jev: finalize → LLM report
+```
+
+Jev returns calibrated probabilities for every choice; the router follows the
+highest-probability action and prints the top three with confidence. Jev may
+*propose* the next tool and finalize, but deterministic gates decide what is
+allowed:
+
+- **Finalize gate** — `finalize` is withheld until at least one tool call has
+  returned successful evidence (`MIN_EVIDENCE_ITEMS`).
+- **Exact repeat guard** — the same `(tool, canonical arguments)` call cannot
+  repeat; the same tool with *different* arguments (e.g. sampling two topics)
+  is still allowed.
+- **Per-tool budget** — each tool is capped at 3 calls per diagnosis.
+- **Total bound** — at most 8 tool calls per diagnosis.
+- **Topic shortlist** — topics are deterministically ranked (name tokens,
+  message type, symptom keywords, prior evidence) down to ≤ 24, and Jev is
+  always offered `none_of_the_above` so it is never forced to pick a bad topic.
+
+**Jev is only allowed to route read-only evidence tools.** `emergency_stop` and
+any future motion/write tool are never in Jev's action set — they stay behind
+the deterministic Safety Gate and the `/stop` command.
+
+The routing layer consumes a single `DiagnosticState` (`symptom`, `tool_calls`,
+`test_results`, `evidence`, `graph_summary`, `step`) and returns a decision, so
+Jev can later be swapped for an LLM-, rule-, or replay-based router without the
+harness below changing.
+
+| | Jev (System 1) | LLM (System 2) |
+|---|---|---|
+| Role | Decide what to investigate next | Explain what the evidence means |
+| Output | Typed choice + calibrated probabilities | Free-form written diagnosis |
+| Speed | ~70–500 ms, parallel, no generation | Seconds, autoregressive |
+| Failure mode | Cannot hallucinate a tool call | Never executes tools; only writes |
+
+With only `DEEPSEEK_API_KEY` (no Jev), the classic LLM function-calling agent
+is used as the fallback. The `/jev` command shows which router is active.
 
 ### Health thresholds
 
@@ -322,6 +450,7 @@ endpoint):
 | `ROBODIAG_MIN_BATTERY_PCT` | `0.10` | minimum battery percentage for motion |
 | `ROBODIAG_MIN_BATTERY_V` | `0.0` | minimum battery voltage for motion |
 | `ROBODIAG_MAX_DIAG_AGE_S` | `5.0` | max age of `/diagnostics` before it is stale |
+| `ROBODIAG_MAX_BATTERY_AGE_S` | `5.0` | max age of battery state before it is stale |
 | `ROBODIAG_MAX_JOINT_STATE_AGE_S` | `1.0` | max age of `/joint_states` before it is stale |
 | `ROBODIAG_DB` | `~/.robodiag_ros2.db` | SQLite history path |
 
@@ -347,10 +476,38 @@ Every run is written to SQLite and can be inspected with `/history` or the
    "No data" is never treated as "normal".
 3. **Structured results.** Evidence and tests are first-class objects
    (`Evidence`, `TestResult`), not free-form strings.
+4. **Narrow decisions, composed in code.** Jev (System 1) only answers "which
+   tool next?" with calibrated probabilities; the LLM (System 2) only writes
+   the explanation. Neither model may choose an emergency stop or a
+   motion/write action.
+
+## Testing
+
+The test suite is split into offline and live parts. The offline parts run
+without ROS 2, `rich`, or any API key — they import only `robodiag_core` and
+`robodiag_jev`.
+
+```bash
+python3 -m unittest test_core            # deterministic core (fully offline)
+python3 test_jev.py                      # Jev next-tool router (offline + live)
+python3 test_request_router.py           # request router (offline + live)
+```
+
+- **`test_core.py`** — unit tests for the deterministic core: JSON/statistics
+  helpers, the SQLite history store, test-result semantics, the Safety Gate, and
+  the routing whitelists. Runs fully offline and also works with
+  `pytest test_core.py`.
+- **`test_jev.py`** — smoke test for the Jev next-tool router. It always runs
+  offline wiring checks; live TypeSafe API checks run only when
+  `TYPESAFE_API_KEY` is available (environment variable or `~/.robodiag.env`)
+  and are skipped otherwise.
+- **`test_request_router.py`** — smoke test for the QUERY / DIAGNOSIS / ACTION /
+  CHAT request router and language detection. Offline wiring checks always run;
+  live classification runs only when `TYPESAFE_API_KEY` is available.
 
 ## Motion extensions (future)
 
-v0.1 provides read-only diagnostic tests and a software stop command. It does
+v0.2 provides read-only diagnostic tests and a software stop command. It does
 not initiate motion.
 
 Future versions may add motion tests and other write actions. When they land:
@@ -375,7 +532,7 @@ When reporting an issue, please include:
 - What you expected and what happened.
 - Relevant logs, with credentials and private information removed.
 
-The v0.1 test catalog is intentionally read-only; new tests should follow the
+The v0.2 test catalog is intentionally read-only; new tests should follow the
 same rule — deterministic, structured evidence, and no motion without a Safety
 Gate precondition.
 
