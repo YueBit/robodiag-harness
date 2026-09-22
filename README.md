@@ -170,10 +170,10 @@ configuration.
    │           Jev request router           │           │   REPL (rich)   │
    │   QUERY / DIAGNOSIS / ACTION / CHAT    │           │ direct dispatch │
    └────────┬───────────┬─────────────┬─────┘           └────────┬────────┘
-            │           │             │ same deterministic tools │
-              QUERY       DIAGNOSIS     ACTION                   │
-              concise     Jev next-     deterministic            │
-              answer      tool loop     policy/safety            │
+            │           │             │                same deterministic tools
+          QUERY       DIAGNOSIS     ACTION                       │
+          concise     Jev next-     deterministic                │
+          answer      tool loop     policy/safety                │
             │           ▼             │                          │
             │  ┌─────────────────┐    │                          │
             │  │  LLM explainer  │    │                          │
