@@ -1,6 +1,6 @@
 # RoboDiag Harness 🩺🤖
 
-**A command-line tool for checking your robot's health and investigating problems.**
+**A diagnostic harness for ROS 2 robots.**
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 ![ROS 2](https://img.shields.io/badge/ROS%202-Humble-22314E)
@@ -8,72 +8,113 @@
 
 ![RoboDiag Harness terminal](assets/robodiag.jpg)
 
-Your robot is connected—but is it working properly? Is sensor data arriving?
-Are there any reported faults? What should you check when something goes wrong?
+Your robot is connected. Is it actually healthy?
 
-RoboDiag brings robot checks, telemetry, and diagnostic tools into one terminal
-interface.
+Is telemetry arriving at the expected rate? Are joints reporting valid values? Are controllers active? What evidence should you collect when something goes wrong?
 
-Think of it as a robot checkup: **collect evidence, inspect problems, and decide
-what to investigate next.**
+RoboDiag brings robot telemetry, deterministic health checks, diagnostic history and AI-assisted investigation into one terminal interface.
 
-## What can I use it for?
+The basic idea is simple:
 
-- **Check your robot** — inspect its status and available diagnostic information.
-- **Inspect sensor readings** — view telemetry and collect samples over time.
-- **Investigate problems** — examine reported faults and review previous results.
-- **Run supported tests** — use the checks and actions available for your robot.
-- **Give an AI assistant access to diagnostic tools** — let it work with robot
-  data through the harness.
+```text
+Robot → Evidence → Tests → Diagnosis
+```
 
-Available features depend on the robot, its software, and the selected
-configuration.
+AI can help decide what to investigate and explain the evidence, but measured robot data and deterministic code remain the source of truth.
 
-## Who is it for?
+## What RoboDiag can do
 
-Robot owners, students, and developers who want a more convenient way to inspect
-and troubleshoot their robots.
+RoboDiag can inspect the live ROS 2 graph, read standard diagnostics, sample arbitrary topics, run deterministic health tests and keep previous results in SQLite.
 
-You will need basic familiarity with a terminal. For the ROS 2 version, you also
-need a working ROS 2 environment.
+It also provides an optional diagnostic agent that can gather evidence through the same tools and explain what the evidence means.
 
-You do **not** need an AI assistant to use the command-line interface.
+Typical uses include:
 
-## What does “Harness” mean?
+* checking whether important robot interfaces are alive
+* inspecting `/diagnostics`, joint states and controller status
+* sampling sensor data over time
+* investigating intermittent or unexpected behavior
+* running repeatable health checks
+* reviewing previous test results
+* giving an AI assistant controlled access to diagnostic tools
 
-A harness connects tools together so they can be used through a common interface.
+You do not need an AI model to use the normal command-line interface.
 
-Here, it connects robot data, diagnostic checks, and supported actions—so you
-can access them from one place.
+## Robot Diagnostic Capability Description
 
-## Getting started with ROS 2
+Different robots expose different diagnostic information.
 
-### 1. Prepare your robot
+A mobile robot may expose battery state and `/cmd_vel`. A manipulator may use `ros2_control`. A quadruped may expose joint states, IMU and odometry but no battery telemetry through ROS.
 
-For most robots, the simplest setup is to run RoboDiag **on the robot's own
-computer**, next to the robot's ROS 2 software:
+RoboDiag uses **RDCD**, Robot Diagnostic Capability Description, to describe which diagnostic capabilities apply to a specific robot.
 
-- ROS 2 is installed on that computer.
-- Your robot's ROS 2 software is running.
-- RoboDiag can reach the robot's topics, services and actions over the local
-  ROS graph.
+RDCD is authored by RoboDiag. The robot does not need to know anything about it.
 
-You can also run RoboDiag **on a separate computer** (ROS 2 is distributed, so
-nodes may live on different machines). In that case, additionally make sure
-that:
+For example, the current Mini Pupper 2 RDCD declares:
 
-- Both machines are on the same network and DDS discovery traffic is not
-  blocked by a firewall.
-- `ROS_DOMAIN_ID` matches on both machines.
-- The ROS 2 distribution and message packages match — if the robot uses custom
-  messages, source its workspace overlay (with `ROBODIAG_WS`, see step 3).
+```yaml
+capabilities:
 
-The launcher looks for ROS 2 under `/opt/ros` on the local machine. It uses the
-distribution identified by `ROS_DISTRO` when available, otherwise it tries
-Humble. RoboDiag does not use the robot's ROS installation remotely — the
-machine it runs on must have ROS 2 installed.
+  diagnostics:
+    topic: /diagnostics
+    message_type: diagnostic_msgs/msg/DiagnosticArray
 
-### 2. Download the project
+  joint_states:
+    topic: /joint_states
+    message_type: sensor_msgs/msg/JointState
+
+  imu:
+    topic: /imu/data
+    message_type: sensor_msgs/msg/Imu
+
+  odometry:
+    topic: /odom
+    message_type: nav_msgs/msg/Odometry
+
+  velocity_command:
+    topic: /cmd_vel
+    message_type: geometry_msgs/msg/Twist
+```
+
+There is no battery capability because Mini Pupper 2 does not currently expose battery telemetry to RoboDiag.
+
+This distinction is important:
+
+```text
+Capability not declared
+        ↓
+Not supported for this robot
+        ↓
+Diagnostic test is N/A
+
+Capability declared
+        ↓
+Expected at runtime
+        ↓
+Missing data is a diagnostic finding
+```
+
+For Mini Pupper 2, RoboDiag therefore does not search for battery telemetry as part of its normal RDCD-based diagnostic path, does not run battery health as an applicable test, and does not require battery evidence in the Safety Gate.
+
+A battery test is shown as `N/A`, not as a fault.
+
+Mini Pupper 2 is the first RDCD reference robot.
+
+## Getting started
+
+### 1. Prepare ROS 2
+
+The simplest setup is to run RoboDiag on the same computer as the robot's ROS 2 software.
+
+Make sure ROS 2 is installed and the robot nodes are running.
+
+RoboDiag can also run on another machine. In that case, both machines need compatible ROS 2 environments and DDS discovery must work across the network.
+
+`ROS_DOMAIN_ID` should match on both machines.
+
+If your robot uses custom message packages, source its workspace before starting RoboDiag.
+
+### 2. Clone the repository
 
 ```bash
 git clone https://github.com/YueBit/robodiag-harness.git
@@ -82,298 +123,264 @@ cd robodiag-harness
 
 ### 3. Start RoboDiag
 
+Generic ROS 2 mode:
+
 ```bash
 bash ./robodiag
 ```
 
-If your robot needs a workspace overlay, specify its location:
+With a workspace overlay:
 
 ```bash
 ROBODIAG_WS=~/robot_ws bash ./robodiag
 ```
 
-The workspace should already be built, with an `install/setup.bash` file.
-
-### 4. Start with a check
-
-Begin with status checks and telemetry inspection. Review the available data
-before acting on a conclusion.
-
-Missing data does not necessarily mean broken hardware: the relevant sensor,
-driver, or ROS 2 node may not be running.
-
-## Configure your robot's interfaces
-
-Robots may use different topic and service names. You can pass these to the
-launcher:
-
-```bash
-bash ./robodiag \
-  --cmd-vel-topic /cmd_vel \
-  --estop-service /emergency_stop
-```
-
-Use the names provided by your robot's software. Specifying a name does not
-create the corresponding topic or service.
-
-## Robot Diagnostic Capability Description (RDCD)
-
-RDCD (Robot Diagnostic Capability Description) tells RoboDiag which diagnostic
-capabilities are supported for a robot and how each maps to that robot's ROS 2
-interfaces. The robot does not generate RDCD; it is RoboDiag-authored,
-robot-specific diagnostic knowledge.
-
-A capability can be:
-
-- **declared** — the RDCD states the robot supports it and maps it to a topic.
-  If a declared topic/type is missing at runtime, that is a real finding.
-- **not declared** — diagnostics for that capability do not apply, are reported
-  as `N/A`, and do not affect overall health.
-
-Select an RDCD with `--rdcd` (a robot id or a path to a YAML file), and inspect
-it with the `/rdcd` command:
+With the Mini Pupper 2 RDCD:
 
 ```bash
 bash ./robodiag --rdcd mini_pupper_2
 ```
 
-Without `--rdcd`, RoboDiag runs in generic mode and auto-discovers interfaces
-as before.
-
-### Mini Pupper 2 (reference robot)
-
-Mini Pupper 2 is the first RDCD reference robot. Because Mini Pupper 2 does not
-expose battery telemetry to RoboDiag, its RDCD does not declare a battery
-capability — battery diagnostics are therefore reported as `N/A` rather than
-treated as missing or faulty, and the motion Safety Gate does not require
-battery evidence for it.
-
-## Using it with an AI assistant
-
-An AI assistant can use diagnostic tools to collect information and help
-interpret it.
-
-A typical workflow is:
-
-1. You describe the problem.
-2. The assistant requests relevant robot data.
-3. It reviews the results and suggests further checks.
-4. You decide whether to act on its suggestions.
-
-**AI suggestions can be wrong.** Check the underlying readings before acting on
-a conclusion.
-
-## Limitations
-
-RoboDiag helps gather and interpret diagnostic evidence. It cannot guarantee
-that a robot is safe or identify every hardware fault.
-
-The checks it can perform depend on the information and control interfaces your
-robot exposes. Support for ROS 2 does not mean every ROS 2 robot works without
-configuration.
-
----
-
-## Features
-
-- Inspect the ROS graph: nodes, topics, services and their types.
-- Collect standard `/diagnostics` (`diagnostic_msgs/DiagnosticArray`).
-- Inspect `ros2_control` through `controller_manager` services, when available.
-- Snapshot/sample **any** discovered ROS 2 topic by loading its message type at
-  runtime; nothing is hard-coded.
-- Time-window sampling with `min/max/mean/std/range` statistics for jitter,
-  drift, dropouts and intermittency.
-- Deterministic health tests (`PASS / WARN / FAIL / SKIP`) persisted to SQLite.
-- A fail-closed Safety Gate for motion-related operations.
-- A software emergency stop (zero Twist + optional Trigger service).
-- An OpenAI-compatible diagnostic agent (DeepSeek by default) with function
-  calling.
-- A Jev (System One) next-tool router: Jev decides which read-only evidence
-  tool to run next, then the LLM writes the final diagnosis.
-- `rich` terminal UI with an animated banner and `/`-command completion.
-
-## How it works
-
-```
-                natural language                          slash commands
-                       │                                         │
-                       ▼                                         ▼
-   ┌────────────────────────────────────────┐           ┌─────────────────┐
-   │           Jev request router           │           │   REPL (rich)   │
-   │   QUERY / DIAGNOSIS / ACTION / CHAT    │           │ direct dispatch │
-   └────────┬───────────┬─────────────┬─────┘           └────────┬────────┘
-            │           │             │                same deterministic tools
-          QUERY       DIAGNOSIS     ACTION                       │
-          concise     Jev next-     deterministic                │
-          answer      tool loop     policy/safety                │
-            │           ▼             │                          │
-            │  ┌─────────────────┐    │                          │
-            │  │  LLM explainer  │    │                          │
-            │  │    symptom +    │    │                          │
-            │  │   evidence →    │    │                          │
-            │  │    diagnosis    │    │                          │
-            │  └────────┬────────┘    │                          │
-            │           │             │                          │
-            ▼           ▼             ▼                          ▼
-   ┌─────────────────────────────────────────────────────────────────────┐
-   │                      Deterministic tool layer                       │
-   │         HarnessNode (rclpy)  ·  TestRunner  ·  HistoryStore         │
-   └────────────┬─────────────────────────────────┬──────────────────────┘
-                │                                 │
-     ROS 2 graph / topics                 SQLite test history
-                │
-          ┌─────┴─────────┐
-          │  Safety Gate  │ fail-closed, no model in the loop
-          │ diagnostics / │ checks freshness + battery + joints
-          │   battery /   │
-          │ joint states  │
-          └───────────────┘
-```
-
-When `TYPESAFE_API_KEY` is not set, the classic LLM function-calling loop is
-used instead of the Jev routing. The division of labour with Jev enabled:
-
-> - **Jev request router classifies the task** (System 1 — QUERY/DIAGNOSIS/ACTION/CHAT).
-> - **Jev diagnostic router decides what to investigate** (System 1, inside DIAGNOSIS).
-> - **Deterministic tools decide what is true** (measured evidence only).
-> - **The LLM explains what it means** (System 2 — written diagnosis).
-> - **The Safety Gate decides what is allowed** (fail-closed, deterministic code).
-
-The core safety rule is unchanged:
-
-> **The LLM may request evidence and tests, but deterministic code decides
-> whether a write or motion operation is permitted.**
-
-### How is this different from `ros2 doctor`?
-
-`ros2 doctor` inspects the local ROS installation and its configuration. RoboDiag
-Harness inspects the **live running graph and robot telemetry**, samples topics
-over time, runs deterministic health tests, stores history, and adds an LLM agent
-that can decide *which* evidence to collect next.
-
-## Project structure
-
-The harness is split into three top-level Python modules plus a launcher, so the
-safety-critical and decision-making pieces stay testable without a running robot.
-
-| File | What it contains | ROS needed? |
-|---|---|---|
-| `robodiag_ros2.py` | Main CLI: the `rclpy` `HarnessNode`, the `rich` REPL, the LLM explainer, and the wiring that connects the tools, the Jev routers and the Safety Gate. | Yes |
-| `robodiag_core.py` | Deterministic core (standard library only): JSON/statistics helpers, the SQLite `HistoryStore`, the read-only `TEST_CATALOG` and `TestRunner`, the fail-closed `SafetyGate`, and the ACTION capability registry. | No |
-| `robodiag_jev.py` | Jev (System One) decision layer (standard library only): the `RequestRouter`, the `DiagnosticState` model, the TypeSafe API client, and the `JevRouter` that picks the next evidence tool. | No |
-| `robodiag` | Bash launcher that sources ROS 2 and your robot workspace, then starts the Python harness. | — |
-
-`robodiag_core.py` and `robodiag_jev.py` import only the Python standard library,
-so the deterministic safety logic and the routing decisions can be unit-tested in
-plain CI without ROS 2, `rich`, or network access.
-
-## Install with pip
-
-`pip install` provides the `robodiag` console command. **rclpy and the ROS
-message packages are not on PyPI** — they come from your ROS 2 distribution, so
-source ROS before running.
+You can also load an RDCD directly from a YAML file:
 
 ```bash
-# from PyPI (once published)
-pip install robodiag-harness             # core (rich only)
-pip install "robodiag-harness[all]"      # + prompt_toolkit completion + openai agent
-
-# from source / editable
-pip install -e ".[all]"
+bash ./robodiag --rdcd path/to/robot.yaml
 ```
 
-> ROS 2 Humble images ship setuptools < 61 and may have no PyPI access. In that
-> case build with the system setuptools instead of an isolated one:
->
-> ```bash
-> pip install --user --no-build-isolation ".[all]"
-> ```
+Without `--rdcd`, RoboDiag stays in generic mode and keeps the existing interface discovery behavior.
 
-### Dependencies
+## Mini Pupper 2
 
-- ROS 2 (tested on Humble; mostly distro-agnostic), Python 3.10
-- `rich` (required)
-- `prompt_toolkit` (optional, live completion)
-- `openai` (optional, AI agent)
-- `ros-humble-controller-manager-msgs` (optional, for ros2_control checks)
+Mini Pupper 2 is currently the first robot with a RoboDiag RDCD.
+
+Its current diagnostic capabilities include:
+
+| Capability | ROS 2 interface |
+|---|---|
+| Diagnostics | `/diagnostics` |
+| Joint states | `/joint_states` |
+| IMU | `/imu/data` |
+| Odometry | `/odom` |
+| Velocity command | `/cmd_vel` |
+| Battery telemetry | Not supported |
+
+Start RoboDiag with:
+
+```bash
+bash ./robodiag --rdcd mini_pupper_2
+```
+
+Then use:
+
+```text
+/rdcd
+```
+
+to inspect the active capability description.
+
+RoboDiag validates declared capabilities against the live ROS graph and reports states such as:
+
+```text
+AVAILABLE
+MISSING
+TYPE_MISMATCH
+```
+
+Capabilities that are not declared by the RDCD are considered not supported for that robot.
 
 ## REPL commands
 
 ![RoboDiag REPL commands](assets/repl-commands.jpg)
 
-```
+```text
 /graph                         ROS graph summary
 /diagnostics                   Standard /diagnostics status
 /control                       ros2_control status
 /check                         Composite read-only health check
 /topic <topic>                 Snapshot one message from a topic
-/sample <topic> [sec] [Hz]     Sample a topic over time and compute statistics
+/sample <topic> [sec] [Hz]     Sample a topic over time
 /tests                         Test catalog
-/run <test_id>                 Run a deterministic test (all read-only in v0.2)
-/history [n]                   Recent n test runs
+/run <test_id>                 Run a deterministic health test
+/history [n]                   Recent test runs
 /safety                        Show the motion Safety Gate
-/stop                          Software stop: zero cmd_vel + optional Trigger service
-/rdcd                          Show the robot's diagnostic capabilities (RDCD)
-/help /quit
+/stop                          Request a software stop
+/rdcd                          Show the active RDCD and capabilities
+/jev                           Show Jev routing status
+/help                          Help
+/quit                          Quit
 ```
 
-Any other input is classified by the Jev request router into `QUERY`,
-`DIAGNOSIS`, `ACTION` or `CHAT` (requires `TYPESAFE_API_KEY`; `DIAGNOSIS` also
-requires `DEEPSEEK_API_KEY` for the final explanation).
+Any other input can be handled as natural language when the corresponding AI configuration is available.
 
-### CLI flags
+Examples:
 
-| Flag | Default | Purpose |
-|---|---|---|
-| `--controller-manager` | `/controller_manager` | controller_manager node namespace |
-| `--cmd-vel-topic` | `/cmd_vel` | topic used by the software stop |
-| `--estop-service` | *(none)* | optional `std_srvs/Trigger` E-stop service |
-| `--db` | `~/.robodiag_ros2.db` | SQLite history path |
-| `--rdcd` | *(none)* | robot id (e.g. `mini_pupper_2`) or path to an RDCD YAML file |
-| `--model` | `deepseek-chat` | LLM model; overrides `DEEPSEEK_MODEL` |
-| `--base-url` | `https://api.deepseek.com` | OpenAI-compatible base URL |
-| `--api-key` | *(none)* | LLM API key (visible in `ps`/shell history) |
-| `--api-key-file` | *(none)* | read the API key from a file (safer) |
-| `--jev-api-key` | *(none)* | TypeSafe API key (visible in `ps`/shell history) |
-| `--jev-api-key-file` | *(none)* | read the TypeSafe API key from a file (safer) |
-| `--jev-base-url` | `https://api.typesafe.ai` | TypeSafe base URL |
-| `--jev-model` | `jev-latest` | Jev model; overrides `TYPESAFE_MODEL` |
+```text
+What is the battery level?
 
-## AI diagnostic agent
+Are there any diagnostic errors?
 
-The agent runs a function-calling loop of at most 10 rounds. Each tool result is
-fed back as structured JSON, and the final answer follows a fixed shape:
-**symptom → evidence → assessment → possible causes → recommended next checks**.
+Why are the joints behaving strangely?
 
-### Tools and risk layers
-
-| Layer | Tool | What it does |
-|---|---|---|
-| Read-only | `inspect_graph` | Nodes, topics, services and types |
-| Read-only | `get_diagnostics` | Cached standard `/diagnostics` statuses |
-| Read-only | `inspect_ros2_control` | Controllers, hardware components, interfaces |
-| Read-only | `get_topic_snapshot` | One message from any discovered topic |
-| Read-only | `sample_topic` | Time-window sampling with statistics |
-| Read-only | `list_tests` | Deterministic test catalog |
-| Read-only | `run_test` | Run one deterministic health test |
-| Read-only | `query_history` | Recent test runs from SQLite |
-| Read-only | `check_motion_safety` | Run the deterministic Safety Gate |
-| **Emergency** | `emergency_stop` | Software stop: zero Twist + optional Trigger service. **Never blocked.** |
-
-v0.2 contains no write or motion tool, so there is nothing to confirm. When
-motion extensions land, the Safety Gate and an explicit operator confirmation
-will gate them. See [Motion extensions (future)](#motion-extensions-future)
-for the plan.
-
-### Configuration
-
-The agent resolves its LLM settings with this precedence:
-
-```
-CLI flags  >  environment variables  >  ~/.robodiag.env  >  built-in defaults
+Check whether the robot looks healthy.
 ```
 
-`~/.robodiag.env`:
+## Deterministic health tests
+
+RoboDiag currently includes these tests:
+
+| Test | Purpose |
+|---|---|
+| `graph_health` | Check whether the ROS graph and core robot signals are present |
+| `diagnostics_health` | Inspect standard `/diagnostics` status and freshness |
+| `battery_health` | Check BatteryState percentage, voltage, freshness and validity |
+| `joint_states_health` | Sample joint states and check rate, values and basic stream health |
+| `ros2_control_health` | Inspect controllers, hardware and interfaces |
+| `system_health` | Run the applicable tests and aggregate the result |
+
+Normal test results are:
+
+```text
+PASS
+WARN
+FAIL
+SKIP
+```
+
+When an RDCD is active, a test whose required capability is not declared is reported as:
+
+```text
+N/A
+```
+
+Internally this is `NOT_SUPPORTED`.
+
+`N/A` does not reduce the overall system health result.
+
+For example, Mini Pupper 2 does not declare battery or `ros2_control` capabilities, so those checks do not count against its health.
+
+A declared capability that should exist but is missing at runtime is different. That remains a real diagnostic finding.
+
+Every test run is stored in SQLite and can be reviewed with `/history`.
+
+## Safety model
+
+RoboDiag keeps diagnostic reasoning separate from action safety.
+
+The main rule is:
+
+> AI may request evidence and tests. Deterministic code decides what is true and what is allowed.
+
+The Safety Gate runs in normal code and does not depend on an LLM.
+
+Without an RDCD, the existing generic safety assumptions are used.
+
+With an RDCD, only capabilities declared for that robot are part of the applicable safety evidence set.
+
+For example:
+
+```text
+Mini Pupper 2 RDCD
+    diagnostics      supported
+    joint_states     supported
+    battery          not supported
+```
+
+The Safety Gate therefore checks diagnostics and joint-state evidence, but does not block Mini Pupper 2 simply because battery telemetry is unavailable.
+
+Missing evidence for a capability that is expected by the active robot configuration still fails closed.
+
+`/stop` sends a software stop command through the configured velocity topic and can optionally call a `std_srvs/Trigger` service.
+
+A software stop is not a replacement for a physical emergency stop.
+
+## AI-assisted diagnosis
+
+RoboDiag supports two diagnostic routing modes.
+
+### Classic function calling
+
+With an OpenAI-compatible model configured, the model can request read-only RoboDiag tools, inspect their results and produce a diagnosis.
+
+DeepSeek is the default configuration, but other OpenAI-compatible endpoints can be used.
+
+### Jev routing
+
+When `TYPESAFE_API_KEY` is configured, Jev acts as a fast decision layer.
+
+It handles two jobs:
+
+```text
+User request
+    ↓
+QUERY / DIAGNOSIS / ACTION / CHAT
+```
+
+For a diagnosis, Jev chooses which read-only evidence tool to call next. Once enough evidence has been collected, the LLM writes the final explanation.
+
+The responsibilities stay separate:
+
+| Component | Responsibility |
+|---|---|
+| Deterministic tools | Measure robot state |
+| Jev | Decide what evidence to collect next |
+| LLM | Explain the collected evidence |
+| Safety Gate | Decide whether an action is permitted |
+
+Jev does not execute motion or write operations.
+
+## Diagnostic tools
+
+| Tool | Purpose |
+|---|---|
+| `inspect_graph` | Inspect nodes, topics, services and types |
+| `get_diagnostics` | Read cached standard diagnostics |
+| `inspect_ros2_control` | Inspect controllers and hardware |
+| `get_topic_snapshot` | Read one message from any discovered topic |
+| `sample_topic` | Sample a topic over a time window |
+| `list_tests` | List deterministic health tests |
+| `run_test` | Run one health test |
+| `query_history` | Read previous test results |
+| `check_motion_safety` | Evaluate the deterministic Safety Gate |
+| `emergency_stop` | Request the software stop path |
+
+Tool results are returned as structured data rather than free-form text.
+
+## Topic sampling
+
+RoboDiag can dynamically load the message type of a discovered ROS 2 topic.
+
+For example:
+
+```text
+/sample /joint_states 3 10
+```
+
+The sampler calculates numeric statistics such as:
+
+```text
+min
+max
+mean
+std
+range
+```
+
+This is useful when investigating sensor variation, intermittent behavior and changing telemetry.
+
+The current sampling implementation is intended as diagnostic evidence collection rather than a high-frequency data acquisition system.
+
+## Configuration
+
+AI configuration follows this precedence:
+
+```text
+CLI flags
+environment variables
+~/.robodiag.env
+built-in defaults
+```
+
+Example `~/.robodiag.env`:
 
 ```bash
 DEEPSEEK_API_KEY=sk-...
@@ -385,200 +392,219 @@ TYPESAFE_BASE_URL=https://api.typesafe.ai
 TYPESAFE_MODEL=jev-latest
 ```
 
-One-off overrides, including non-DeepSeek providers (any OpenAI-compatible
-endpoint):
+Examples:
 
 ```bash
 ./robodiag --model deepseek-reasoner
-./robodiag --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 --model qwen-max
-./robodiag --api-key-file ~/.deepseek.key      # safer than --api-key
+
+./robodiag \
+  --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 \
+  --model qwen-max
+
+./robodiag --api-key-file ~/.deepseek.key
 ```
 
-> `--api-key` works but is visible in `ps` and shell history. Prefer
-> `DEEPSEEK_API_KEY` in `~/.robodiag.env` (mode `600`) or `--api-key-file`.
->
-> Jev uses the same precedence: `--jev-*` flags > `TYPESAFE_*` environment
-> variables > `~/.robodiag.env` > built-in defaults.
+Using `--api-key` or `--jev-api-key` directly can expose the key through shell history or process listings. Environment variables, `~/.robodiag.env`, or key files are safer.
 
-## Jev System One routing
+## CLI options
 
-With `TYPESAFE_API_KEY` set, Jev — TypeSafe's System One model — has two
-separate routing roles:
+| Option | Default | Purpose |
+|---|---|---|
+| `--rdcd` | none | Robot ID or RDCD YAML path |
+| `--controller-manager` | `/controller_manager` | ros2_control manager namespace |
+| `--cmd-vel-topic` | `/cmd_vel` | Fallback software-stop Twist topic |
+| `--estop-service` | none | Optional Trigger stop service |
+| `--db` | `~/.robodiag_ros2.db` | SQLite history path |
+| `--model` | `deepseek-chat` | LLM model |
+| `--base-url` | `https://api.deepseek.com` | OpenAI-compatible endpoint |
+| `--api-key-file` | none | Read LLM API key from a file |
+| `--jev-model` | `jev-latest` | Jev model |
+| `--jev-base-url` | `https://api.typesafe.ai` | TypeSafe endpoint |
+| `--jev-api-key-file` | none | Read TypeSafe key from a file |
 
-1. **Request routing** — first classify the operator's input into one of
-   `QUERY`, `DIAGNOSIS`, `ACTION` or `CHAT` (and, for `QUERY`/`ACTION`, resolve
-   the specific capability/action).
-2. **Diagnostic routing** — if (and only if) the input is a `DIAGNOSIS`, decide
-   which evidence/tool to collect next.
+## Health thresholds
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ROBODIAG_MIN_BATTERY_PCT` | `0.10` | Minimum battery percentage when battery is applicable |
+| `ROBODIAG_MIN_BATTERY_V` | `0.0` | Minimum battery voltage when configured |
+| `ROBODIAG_MAX_DIAG_AGE_S` | `5.0` | Maximum diagnostics age |
+| `ROBODIAG_MAX_BATTERY_AGE_S` | `5.0` | Maximum battery-state age |
+| `ROBODIAG_MAX_JOINT_STATE_AGE_S` | `1.0` | Maximum joint-state age |
+| `ROBODIAG_DB` | `~/.robodiag_ros2.db` | History database |
+
+## How it works
 
 ```text
-user input → Jev request router
-               ├─ QUERY     → one deterministic lookup → concise answer
-               ├─ DIAGNOSIS → Jev diagnostic loop → LLM explanation
-               ├─ ACTION    → deterministic read-only test / software stop
-               └─ CHAT      → lightweight reply (no tools)
+                    user
+                     │
+          ┌──────────┴──────────┐
+          │                     │
+    natural language        REPL commands
+          │                     │
+          ▼                     ▼
+    request routing       direct dispatch
+          │                     │
+          └──────────┬──────────┘
+                     ▼
+          deterministic tool layer
+                     │
+          ┌──────────┼───────────┐
+          │          │           │
+       tests      history    Safety Gate
+          │                      │
+          └──────────┬───────────┘
+                     │
+                    RDCD
+              when configured
+                     │
+                     ▼
+                ROS 2 robot
 ```
 
-Simple questions such as "what is the battery level?" are answered directly
-(`Battery: 73% (15.6 V)`) without entering the diagnostic loop.
+RDCD determines which robot capabilities are applicable.
 
-RoboDiag replies in the same language as the operator. The language is detected
-from the script of the input (e.g. `现在电量多少？` → Chinese); when the language
-is unclear (for example Latin-script text), replies default to English.
+The ROS graph provides the actual runtime evidence.
 
-### Diagnostic routing
+The test layer evaluates that evidence.
 
-Inside a `DIAGNOSIS`, Jev acts as a fast **next-tool router**:
+AI sits above the deterministic tools and does not replace them.
 
-1. Jev receives the symptom and the evidence collected so far.
-2. Jev picks the next read-only diagnostic action (a `Choice` over the tool set).
-3. The deterministic tool runs and its result is appended to the evidence.
-4. When Jev picks `finalize`, the LLM (System 2) writes the final diagnosis:
-   symptom → evidence → assessment → possible causes → recommended next checks.
+## Project structure
 
-```text
-symptom → Jev: get_diagnostics → Jev: run_test(joint_states_health)
-        → Jev: sample_topic(/joint_states) → Jev: finalize → LLM report
+| File | Purpose | ROS required? |
+|---|---|---|
+| `robodiag_ros2.py` | ROS node, CLI, REPL, topic tools, AI integration | Yes |
+| `robodiag_core.py` | Test runner, history, Safety Gate, deterministic core | No |
+| `robodiag_rdcd.py` | RDCD loading, validation and capability status | No |
+| `robodiag_jev.py` | Jev routing and diagnostic state | No |
+| `robodiag` | Launcher | Shell / ROS environment |
+| `rdcd/mini_pupper_2.yaml` | First robot-specific RDCD | No |
+
+The deterministic core, RDCD logic and Jev routing can all be tested without a running ROS environment.
+
+## Installation with pip
+
+`rclpy` and ROS message packages are provided by the ROS 2 installation rather than PyPI.
+
+From source:
+
+```bash
+pip install -e ".[all]"
 ```
 
-Jev returns calibrated probabilities for every choice; the router follows the
-highest-probability action and prints the top three with confidence. Jev may
-*propose* the next tool and finalize, but deterministic gates decide what is
-allowed:
+For ROS 2 Humble environments using an older system `setuptools`:
 
-- **Finalize gate** — `finalize` is withheld until at least one tool call has
-  returned successful evidence (`MIN_EVIDENCE_ITEMS`).
-- **Exact repeat guard** — the same `(tool, canonical arguments)` call cannot
-  repeat; the same tool with *different* arguments (e.g. sampling two topics)
-  is still allowed.
-- **Per-tool budget** — each tool is capped at 3 calls per diagnosis.
-- **Total bound** — at most 8 tool calls per diagnosis.
-- **Topic shortlist** — topics are deterministically ranked (name tokens,
-  message type, symptom keywords, prior evidence) down to ≤ 24, and Jev is
-  always offered `none_of_the_above` so it is never forced to pick a bad topic.
+```bash
+pip install --user --no-build-isolation ".[all]"
+```
 
-**Jev is only allowed to route read-only evidence tools.** `emergency_stop` and
-any future motion/write tool are never in Jev's action set — they stay behind
-the deterministic Safety Gate and the `/stop` command.
+Once the package is published to PyPI, the intended installation is:
 
-The routing layer consumes a single `DiagnosticState` (`symptom`, `tool_calls`,
-`test_results`, `evidence`, `graph_summary`, `step`) and returns a decision, so
-Jev can later be swapped for an LLM-, rule-, or replay-based router without the
-harness below changing.
+```bash
+pip install robodiag-harness
+```
 
-| | Jev (System 1) | LLM (System 2) |
-|---|---|---|
-| Role | Decide what to investigate next | Explain what the evidence means |
-| Output | Typed choice + calibrated probabilities | Free-form written diagnosis |
-| Speed | ~70–500 ms, parallel, no generation | Seconds, autoregressive |
-| Failure mode | Cannot hallucinate a tool call | Never executes tools; only writes |
+or:
 
-With only `DEEPSEEK_API_KEY` (no Jev), the classic LLM function-calling agent
-is used as the fallback. The `/jev` command shows which router is active.
+```bash
+pip install "robodiag-harness[all]"
+```
 
-### Health thresholds
+### Dependencies
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `ROBODIAG_MIN_BATTERY_PCT` | `0.10` | minimum battery percentage for motion |
-| `ROBODIAG_MIN_BATTERY_V` | `0.0` | minimum battery voltage for motion |
-| `ROBODIAG_MAX_DIAG_AGE_S` | `5.0` | max age of `/diagnostics` before it is stale |
-| `ROBODIAG_MAX_BATTERY_AGE_S` | `5.0` | max age of battery state before it is stale |
-| `ROBODIAG_MAX_JOINT_STATE_AGE_S` | `1.0` | max age of `/joint_states` before it is stale |
-| `ROBODIAG_DB` | `~/.robodiag_ros2.db` | SQLite history path |
-
-## Test catalog
-
-| `test_id` | Checks | Outcomes |
-|---|---|---|
-| `graph_health` | Node/topic counts; presence of `/joint_states` | `FAIL` if only the harness node is visible; `WARN` if `/joint_states` is missing |
-| `diagnostics_health` | `/diagnostics` freshness and levels | `SKIP` if none received; `FAIL` on stale or ERROR/STALE; `WARN` on WARN |
-| `battery_health` | `BatteryState` percentage, voltage, freshness and validity | `SKIP` if none received; `FAIL` on stale or invalid percentage/voltage; `WARN` on low battery or `present=False` |
-| `joint_states_health` | Samples `/joint_states`: rate, finite values, named joints | `WARN` on low rate / few samples / missing positions |
-| `ros2_control_health` | `controller_manager` controllers, hardware, interfaces | `SKIP` if unavailable; `FAIL` if hardware is not active |
-| `system_health` | Composite of the five tests above | Worst sub-result |
-
-> `battery_health` is unit-tested but not yet verified on physical robot hardware.
->
-> With an RDCD, a test whose capability is not declared (e.g. battery on Mini
-> Pupper 2) is reported as `N/A` and excluded from `system_health`; a declared
-> capability that is missing at runtime remains a real finding.
-
-Every run is written to SQLite and can be inspected with `/history` or the
-`query_history` tool.
-
-## Design principles
-
-1. **Evidence before reasoning.** The agent must gather real telemetry; it may
-   not invent hardware state from the robot model.
-2. **Deterministic code decides writes.** The Safety Gate is plain code, is
-   fail-closed, and distinguishes *unhealthy* evidence from *missing* evidence.
-   "No data" is never treated as "normal".
-3. **Structured results.** Evidence and tests are first-class objects
-   (`Evidence`, `TestResult`), not free-form strings.
-4. **Narrow decisions, composed in code.** Jev (System 1) only answers "which
-   tool next?" with calibrated probabilities; the LLM (System 2) only writes
-   the explanation. Neither model may choose an emergency stop or a
-   motion/write action.
+| Dependency | Purpose |
+|---|---|
+| ROS 2 Humble | Current tested ROS environment |
+| Python 3.10 | Runtime |
+| `rich` | Terminal UI |
+| `prompt_toolkit` | Optional command completion |
+| `openai` | Optional AI agent |
+| `controller_manager_msgs` | Optional ros2_control inspection |
 
 ## Testing
 
-The test suite is split into offline and live parts. The offline parts run
-without ROS 2, `rich`, or any API key — they import only `robodiag_core` and
-`robodiag_jev`.
+The core test suite can run without ROS 2 or API keys.
 
 ```bash
-python3 -m unittest test_core            # deterministic core (fully offline)
-python3 test_jev.py                      # Jev next-tool router (offline + live)
-python3 test_request_router.py           # request router (offline + live)
+python3 -m unittest test_core
+python3 -m unittest test_rdcd
+python3 test_jev.py
+python3 test_request_router.py
 ```
 
-- **`test_core.py`** — unit tests for the deterministic core: JSON/statistics
-  helpers, the SQLite history store, test-result semantics, the Safety Gate, and
-  the routing whitelists. Runs fully offline and also works with
-  `pytest test_core.py`.
-- **`test_jev.py`** — smoke test for the Jev next-tool router. It always runs
-  offline wiring checks; live TypeSafe API checks run only when
-  `TYPESAFE_API_KEY` is available (environment variable or `~/.robodiag.env`)
-  and are skipped otherwise.
-- **`test_request_router.py`** — smoke test for the QUERY / DIAGNOSIS / ACTION /
-  CHAT request router and language detection. Offline wiring checks always run;
-  live classification runs only when `TYPESAFE_API_KEY` is available.
+`test_core.py` covers the deterministic test runner, history and Safety Gate.
 
-## Motion extensions (future)
+`test_rdcd.py` covers RDCD loading, capability applicability, runtime availability, `NOT_SUPPORTED` behavior, system-health aggregation and RDCD-aware SafetyGate behavior.
 
-v0.2 provides read-only diagnostic tests and a software stop command. It does
-not initiate motion.
+`test_jev.py` contains offline routing checks and optional live TypeSafe tests.
 
-Future versions may add motion tests and other write actions. When they land:
+`test_request_router.py` tests request classification and language handling.
 
-- The Safety Gate and an explicit operator confirmation will gate them.
-- Place the robot in a clear, stable area and keep people and obstacles away
-  from moving parts before any movement test.
-- Know how to stop your robot independently of RoboDiag.
-- Review the requested action before confirming it.
+## Design principles
 
-A software stop command depends on the robot's implementation and communication
-connection. It does **not** replace a physical emergency stop.
+**Evidence before reasoning**
+
+Robot state should come from measured telemetry, not assumptions made by an AI model.
+
+**Robot-specific applicability**
+
+A missing capability and an unsupported capability are not the same thing. RDCD defines what RoboDiag should expect from a particular robot.
+
+**Deterministic diagnostics**
+
+Health tests return structured results based on measured evidence.
+
+**Deterministic safety**
+
+AI can request information, but it does not decide whether a motion or write operation is safe.
+
+**Generic robot access where possible**
+
+RoboDiag can inspect arbitrary ROS topics without an RDCD. RDCD adds robot-specific diagnostic knowledge on top of that generic capability.
+
+## Current limitations
+
+RoboDiag is an experimental diagnostic harness, not a certified robot safety system.
+
+The first RDCD currently targets Mini Pupper 2. Supporting additional robot families will require additional RoboDiag-authored capability descriptions and, where necessary, support for their interfaces.
+
+The current software stop depends on the robot's ROS implementation and communication path.
+
+Health checks can only evaluate information the robot makes observable.
+
+AI-generated explanations may be wrong. Always review the underlying evidence.
+
+## Future direction
+
+RDCD is intended to separate robot-specific diagnostic knowledge from the generic RoboDiag runtime.
+
+The long-term model is:
+
+```text
+Mini Pupper 2 + Mini Pupper RDCD
+                │
+                ▼
+          RoboDiag Harness
+
+Future robot + its RDCD
+                │
+                ▼
+        same RoboDiag Harness
+```
+
+The RDCD schema is still experimental. Mini Pupper 2 is the first implementation and will be used to learn what belongs in the description before the format is generalized further.
 
 ## Contributing
 
-Bug reports, documentation improvements, and robot integrations are welcome.
+Bug reports, documentation improvements, diagnostic tests and robot integrations are welcome.
 
-When reporting an issue, please include:
+When reporting an issue, include the robot model, ROS 2 distribution, the command you ran, the expected behavior and relevant logs.
 
-- Your robot model and ROS 2 distribution.
-- The command or check you ran.
-- What you expected and what happened.
-- Relevant logs, with credentials and private information removed.
-
-The v0.2 test catalog is intentionally read-only; new tests should follow the
-same rule — deterministic, structured evidence, and no motion without a Safety
-Gate precondition.
+Please remove credentials or private information from logs before posting them.
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](LICENSE).
 
-ROS and ROS 2 are trademarks of Open Robotics. This project is not affiliated
-with or endorsed by Open Robotics or Intrinsic.
+ROS and ROS 2 are trademarks of Open Robotics. This project is not affiliated with or endorsed by Open Robotics or Intrinsic.
