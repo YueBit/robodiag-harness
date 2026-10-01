@@ -321,6 +321,11 @@ TEST_CATALOG = {
         "description": "Inspect /diagnostics and fail on ERROR/STALE; WARN remains warning.",
         "writes": False,
     },
+    "battery_health": {
+        "name": "Battery health",
+        "description": "Inspect the BatteryState topic and check percentage, voltage, freshness and validity.",
+        "writes": False,
+    },
     "joint_states_health": {
         "name": "Joint-state stream health",
         "description": "Sample /joint_states and check freshness, rate, finite values and movement jitter evidence.",
@@ -333,17 +338,26 @@ TEST_CATALOG = {
     },
     "system_health": {
         "name": "Composite system health",
-        "description": "Run graph, diagnostics, joint-state and ros2_control checks and aggregate the result.",
+        "description": "Run graph, diagnostics, battery, joint-state and ros2_control checks and aggregate the result.",
         "writes": False,
     },
 }
 
 
 class TestRunner:
-    def __init__(self, node: Any, history: HistoryStore, max_diag_age_s: float = 5.0):
+    def __init__(
+        self,
+        node: Any,
+        history: HistoryStore,
+        max_diag_age_s: float = 5.0,
+        max_battery_age_s: float = 5.0,
+        min_battery_pct: float = 0.10,
+    ):
         self.node = node
         self.history = history
         self.max_diag_age_s = max_diag_age_s
+        self.max_battery_age_s = max_battery_age_s
+        self.min_battery_pct = min_battery_pct
 
     @staticmethod
     def _severity(result: str) -> int:
@@ -413,6 +427,35 @@ class TestRunner:
             return "WARN", f"{len(warns)} diagnostic component(s) WARN — " + "; ".join(warns[:5]), evidence
         return "PASS", "All received standard diagnostic statuses are OK.", evidence
 
+    def _test_battery_health(self) -> tuple[str, str, list[dict[str, Any]]]:
+        b = self.node.battery_state()
+        evidence = [asdict(Evidence("battery_state", "state", b, now_iso()))]
+        if not b.get("available"):
+            return "SKIP", "No BatteryState message has been received.", evidence
+
+        age = b.get("age_s")
+        if age is not None and age > self.max_battery_age_s:
+            return "FAIL", f"BatteryState is stale ({age:.1f}s; threshold {self.max_battery_age_s:.1f}s).", evidence
+
+        # _on_battery stores None for a non-finite voltage or a non-finite /
+        # negative percentage, so a None here means the field was invalid.
+        invalid = []
+        if b.get("percentage") is None:
+            invalid.append("percentage")
+        if b.get("voltage") is None:
+            invalid.append("voltage")
+        if invalid:
+            return "FAIL", "Invalid battery data: " + ", ".join(invalid) + ".", evidence
+
+        pct = b["percentage"]
+        voltage = b["voltage"]
+        if pct < self.min_battery_pct:
+            return "WARN", f"Battery low: {pct:.0%} below {self.min_battery_pct:.0%} ({voltage:.1f} V).", evidence
+        if b.get("present") is False:
+            return "WARN", "Battery reports present=False (no battery detected).", evidence
+
+        return "PASS", f"BatteryState healthy: {pct:.0%} ({voltage:.1f} V).", evidence
+
     def _test_joint_states_health(self) -> tuple[str, str, list[dict[str, Any]]]:
         s = self.node.sample_topic("/joint_states", duration_s=2.5, rate_hz=10.0)
         evidence = [asdict(Evidence("/joint_states", "sample", s, now_iso()))]
@@ -460,6 +503,7 @@ class TestRunner:
         sub_ids = [
             "graph_health",
             "diagnostics_health",
+            "battery_health",
             "joint_states_health",
             "ros2_control_health",
         ]

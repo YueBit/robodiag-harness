@@ -459,9 +459,10 @@ is used as the fallback. The `/jev` command shows which router is active.
 |---|---|---|
 | `graph_health` | Node/topic counts; presence of `/joint_states` | `FAIL` if only the harness node is visible; `WARN` if `/joint_states` is missing |
 | `diagnostics_health` | `/diagnostics` freshness and levels | `SKIP` if none received; `FAIL` on stale or ERROR/STALE; `WARN` on WARN |
+| `battery_health` | `BatteryState` percentage, voltage, freshness and validity | `SKIP` if none received; `FAIL` on stale or invalid percentage/voltage; `WARN` on low battery or `present=False` |
 | `joint_states_health` | Samples `/joint_states`: rate, finite values, named joints | `WARN` on low rate / few samples / missing positions |
 | `ros2_control_health` | `controller_manager` controllers, hardware, interfaces | `SKIP` if unavailable; `FAIL` if hardware is not active |
-| `system_health` | Composite of the four tests above | Worst sub-result |
+| `system_health` | Composite of the five tests above | Worst sub-result |
 
 Every run is written to SQLite and can be inspected with `/history` or the
 `query_history` tool.

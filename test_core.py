@@ -184,11 +184,55 @@ class TestTestRunner(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             runner = core.TestRunner(FakeHealthyNode(), core.HistoryStore(Path(d) / "h.db"))
             res = runner.run("system_health")
-        # FakeHealthyNode: graph PASS, diagnostics SKIP (no data), joints PASS,
-        # ros2_control SKIP → worst is SKIP (severity 1) → overall PASS.
+        # FakeHealthyNode: graph PASS, diagnostics PASS, battery PASS, joints
+        # PASS, ros2_control SKIP → worst is SKIP (severity 1) → overall PASS.
         self.assertEqual(res["result"], "PASS")
         self.assertIs(res["ok"], True)
         self.assertIn("graph_health=PASS", res["summary"])
+        self.assertIn("battery_health=PASS", res["summary"])
+
+
+class TestBatteryHealth(unittest.TestCase):
+    def _run(self, battery: dict) -> dict:
+        node = mock.Mock()
+        node.battery_state.return_value = battery
+        with tempfile.TemporaryDirectory() as d:
+            runner = core.TestRunner(node, core.HistoryStore(Path(d) / "h.db"))
+            return runner.run("battery_health")
+
+    def test_healthy_passes(self):
+        res = self._run(
+            {"available": True, "age_s": 0.5, "percentage": 0.8, "voltage": 15.6, "present": True}
+        )
+        self.assertEqual(res["result"], "PASS")
+
+    def test_missing_skips(self):
+        res = self._run({"available": False})
+        self.assertEqual(res["result"], "SKIP")
+
+    def test_stale_fails(self):
+        res = self._run({"available": True, "age_s": 7.0, "percentage": 0.8, "voltage": 15.6})
+        self.assertEqual(res["result"], "FAIL")
+
+    def test_invalid_percentage_fails(self):
+        res = self._run({"available": True, "age_s": 0.5, "percentage": None, "voltage": 15.6})
+        self.assertEqual(res["result"], "FAIL")
+
+    def test_invalid_voltage_fails(self):
+        res = self._run({"available": True, "age_s": 0.5, "percentage": 0.8, "voltage": None})
+        self.assertEqual(res["result"], "FAIL")
+
+    def test_low_battery_warns(self):
+        res = self._run(
+            {"available": True, "age_s": 0.5, "percentage": 0.05, "voltage": 15.6, "present": True}
+        )
+        self.assertEqual(res["result"], "WARN")
+
+    def test_not_present_warns(self):
+        res = self._run(
+            {"available": True, "age_s": 0.5, "percentage": 0.8, "voltage": 15.6, "present": False}
+        )
+        self.assertEqual(res["result"], "WARN")
 
 
 class TestSafetyGate(unittest.TestCase):

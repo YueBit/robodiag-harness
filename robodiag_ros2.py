@@ -2322,6 +2322,8 @@ def main(argv: list[str] | None = None) -> int:
         node,
         history_store,
         max_diag_age_s=env_float("ROBODIAG_MAX_DIAG_AGE_S", 5.0),
+        max_battery_age_s=env_float("ROBODIAG_MAX_BATTERY_AGE_S", 5.0),
+        min_battery_pct=env_float("ROBODIAG_MIN_BATTERY_PCT", 0.10),
     )
     runtime = AgentRuntime(node, runner, history_store, gate)
 
