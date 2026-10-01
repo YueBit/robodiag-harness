@@ -182,6 +182,18 @@ class TestTestRunnerWithRdcd(unittest.TestCase):
         # No RDCD → battery_health runs and reports SKIP (no BatteryState data).
         self.assertEqual(res["result"], "SKIP")
 
+    def test_runtime_switch(self):
+        # The same runner honors its current rdcd, so switching RDCD at runtime
+        # (as the REPL /rdcd command does) takes effect immediately.
+        node = FakeNode()
+        with tempfile.TemporaryDirectory() as d:
+            runner = core.TestRunner(node, core.HistoryStore(Path(d) / "h.db"), rdcd=None)
+            self.assertEqual(runner.run("battery_health")["result"], "SKIP")
+            runner.rdcd = make_rdcd()
+            self.assertEqual(runner.run("battery_health")["result"], "NOT_SUPPORTED")
+            runner.rdcd = None
+            self.assertEqual(runner.run("battery_health")["result"], "SKIP")
+
 
 class TestSafetyGateWithRdcd(unittest.TestCase):
     def _gate(self, node, rdcd):

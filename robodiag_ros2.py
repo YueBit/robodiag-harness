@@ -1853,7 +1853,7 @@ HELP = f"""[bold]RoboDiag ROS 2 Harness v{VERSION}[/bold]
   /history \[n]                  Recent n test runs
   /safety                        Show the motion Safety Gate
   /stop                          Software stop: zero cmd_vel + optional Trigger service
-  /rdcd                          Show the robot's diagnostic capabilities (RDCD)
+  /rdcd [robot|path|off]        Show or switch the active RDCD
   /jev                           Show Jev (System 1) routing status
   /help                          Help
   /quit                          Quit
@@ -1883,7 +1883,7 @@ REPL_COMMANDS: list[tuple[str, str]] = [
     ("/history", "Recent test runs"),
     ("/safety", "Show the motion Safety Gate"),
     ("/stop", "Software stop (zero cmd_vel + optional Trigger)"),
-    ("/rdcd", "Show the robot's diagnostic capabilities (RDCD)"),
+    ("/rdcd", "Show or switch the robot's diagnostic capabilities (RDCD)"),
     ("/jev", "Show Jev (System 1) routing status"),
     ("/quit", "Quit"),
 ]
@@ -2075,7 +2075,7 @@ def print_rdcd(rdcd: Rdcd | None, topic_types: dict[str, list[str]]) -> None:
     if rdcd is None:
         console.print(
             "[yellow]No RDCD selected (generic mode). "
-            "Start with --rdcd to load robot-specific capabilities.[/yellow]"
+            "Use /rdcd <robot-id|path> to load one, or /rdcd off to clear it.[/yellow]"
         )
         return
 
@@ -2261,6 +2261,26 @@ def repl(
                     console.print("[yellow]Jev router disabled. Set TYPESAFE_API_KEY to enable System 1 routing.[/yellow]")
                 continue
             if line == "/rdcd":
+                print_rdcd(node.rdcd, node._topic_type_map())
+                continue
+            if line.startswith("/rdcd "):
+                arg = line.split(maxsplit=1)[1].strip()
+                if arg in ("off", "none", "generic"):
+                    new_rdcd = None
+                else:
+                    try:
+                        new_rdcd = resolve_rdcd(arg)
+                    except RdcdError as exc:
+                        console.print(f"[red]{exc}[/red]")
+                        continue
+                node.rdcd = new_rdcd
+                runner.rdcd = new_rdcd
+                gate.rdcd = new_rdcd
+                node._ensure_common_subscriptions()
+                if new_rdcd is None:
+                    console.print("[green]RDCD cleared — generic mode.[/green]")
+                else:
+                    console.print(f"[green]RDCD switched to {new_rdcd.name}.[/green]")
                 print_rdcd(node.rdcd, node._topic_type_map())
                 continue
             if line.startswith("/"):

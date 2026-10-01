@@ -178,6 +178,16 @@ Then use:
 
 to inspect the active capability description.
 
+The RDCD can also be switched at runtime without restarting:
+
+```text
+/rdcd mini_pupper_2
+/rdcd path/to/other_robot.yaml
+/rdcd off
+```
+
+`/rdcd off` returns to generic mode.
+
 RoboDiag validates declared capabilities against the live ROS graph and reports states such as:
 
 ```text
@@ -204,7 +214,7 @@ Capabilities that are not declared by the RDCD are considered not supported for 
 /history [n]                   Recent test runs
 /safety                        Show the motion Safety Gate
 /stop                          Request a software stop
-/rdcd                          Show the active RDCD and capabilities
+/rdcd [robot|path|off]         Show or switch the active RDCD
 /jev                           Show Jev routing status
 /help                          Help
 /quit                          Quit
