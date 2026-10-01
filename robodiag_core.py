@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from robodiag_jev import Evidence, QueryCapability, TestResult
+from robodiag_rdcd import Rdcd
 
 # DiagnosticStatus.level is a `byte` field; on ROS 2 Humble the class constants
 # are `bytes` (b'\x00'..b'\x03'), so use plain ints internally.
@@ -238,6 +239,7 @@ class SafetyGate:
         max_diag_age_s: float,
         max_joint_age_s: float,
         max_battery_age_s: float = 5.0,
+        rdcd: Rdcd | None = None,
     ):
         self.node = node
         self.min_battery_pct = min_battery_pct
@@ -245,64 +247,79 @@ class SafetyGate:
         self.max_diag_age_s = max_diag_age_s
         self.max_joint_age_s = max_joint_age_s
         self.max_battery_age_s = max_battery_age_s
+        self.rdcd = rdcd
+
+    def _requires(self, capability: str) -> bool:
+        """Whether a capability belongs to the applicable safety evidence set.
+
+        Generic mode (no RDCD) keeps the existing assumption that every
+        evidence class is required. With an RDCD, only declared capabilities
+        are required — so e.g. a robot without battery telemetry is not blocked
+        merely because no battery data exists.
+        """
+        return self.rdcd is None or self.rdcd.has(capability)
 
     def check_for_motion(self) -> dict[str, Any]:
         """Fail closed: deny motion unless required evidence is present and healthy.
 
         Missing evidence (no /diagnostics, battery, or /joint_states) is treated
         as unsafe, never as "normal". This matches the design principle that
-        "no data" must not permit motion.
+        "no data" must not permit motion. Capabilities that the active RDCD does
+        not declare are simply not part of the required evidence set.
         """
         checks: list[dict[str, Any]] = []
         allow = True
 
-        diag = self.node.get_diagnostics(include_ok=False)
-        if diag.get("available"):
-            age = diag.get("last_array_age_s")
-            if age is not None and age > self.max_diag_age_s:
-                allow = False
-                checks.append({"check": "diagnostics_fresh", "ok": False, "reason": f"/diagnostics stale: {age}s"})
-            else:
-                bad = [x for x in diag["statuses"] if x["level"] >= DIAG_ERROR]
-                if bad:
+        if self._requires("diagnostics"):
+            diag = self.node.get_diagnostics(include_ok=False)
+            if diag.get("available"):
+                age = diag.get("last_array_age_s")
+                if age is not None and age > self.max_diag_age_s:
                     allow = False
-                    checks.append({"check": "diagnostics", "ok": False, "reason": f"critical diagnostic statuses: {len(bad)}", "items": bad[:5]})
+                    checks.append({"check": "diagnostics_fresh", "ok": False, "reason": f"/diagnostics stale: {age}s"})
                 else:
-                    checks.append({"check": "diagnostics", "ok": True})
-        else:
-            allow = False
-            checks.append({"check": "diagnostics", "ok": False, "reason": "no /diagnostics evidence (missing)"})
-
-        battery = self.node.battery_state()
-        if battery.get("available"):
-            if battery.get("age_s", 999) > self.max_battery_age_s:
-                allow = False
-                checks.append({"check": "battery_fresh", "ok": False, "reason": f"battery state stale: {battery['age_s']}s"})
+                    bad = [x for x in diag["statuses"] if x["level"] >= DIAG_ERROR]
+                    if bad:
+                        allow = False
+                        checks.append({"check": "diagnostics", "ok": False, "reason": f"critical diagnostic statuses: {len(bad)}", "items": bad[:5]})
+                    else:
+                        checks.append({"check": "diagnostics", "ok": True})
             else:
-                pct = battery.get("percentage")
-                voltage = battery.get("voltage")
-                if pct is not None and self.min_battery_pct > 0 and pct < self.min_battery_pct:
+                allow = False
+                checks.append({"check": "diagnostics", "ok": False, "reason": "no /diagnostics evidence (missing)"})
+
+        if self._requires("battery"):
+            battery = self.node.battery_state()
+            if battery.get("available"):
+                if battery.get("age_s", 999) > self.max_battery_age_s:
                     allow = False
-                    checks.append({"check": "battery_pct", "ok": False, "reason": f"battery {pct:.1%} < {self.min_battery_pct:.1%}"})
-                elif voltage is not None and self.min_battery_v > 0 and voltage < self.min_battery_v:
-                    allow = False
-                    checks.append({"check": "battery_voltage", "ok": False, "reason": f"battery {voltage:.2f}V < {self.min_battery_v:.2f}V"})
+                    checks.append({"check": "battery_fresh", "ok": False, "reason": f"battery state stale: {battery['age_s']}s"})
                 else:
-                    checks.append({"check": "battery", "ok": True, "value": battery})
-        else:
-            allow = False
-            checks.append({"check": "battery", "ok": False, "reason": "no BatteryState topic discovered (missing)"})
-
-        joint = self.node.joint_state_cached()
-        if joint.get("available"):
-            if joint.get("age_s", 999) > self.max_joint_age_s:
-                allow = False
-                checks.append({"check": "joint_states_fresh", "ok": False, "reason": f"/joint_states stale: {joint['age_s']}s"})
+                    pct = battery.get("percentage")
+                    voltage = battery.get("voltage")
+                    if pct is not None and self.min_battery_pct > 0 and pct < self.min_battery_pct:
+                        allow = False
+                        checks.append({"check": "battery_pct", "ok": False, "reason": f"battery {pct:.1%} < {self.min_battery_pct:.1%}"})
+                    elif voltage is not None and self.min_battery_v > 0 and voltage < self.min_battery_v:
+                        allow = False
+                        checks.append({"check": "battery_voltage", "ok": False, "reason": f"battery {voltage:.2f}V < {self.min_battery_v:.2f}V"})
+                    else:
+                        checks.append({"check": "battery", "ok": True, "value": battery})
             else:
-                checks.append({"check": "joint_states_fresh", "ok": True, "age_s": joint["age_s"]})
-        else:
-            allow = False
-            checks.append({"check": "joint_states", "ok": False, "reason": "no /joint_states evidence (missing)"})
+                allow = False
+                checks.append({"check": "battery", "ok": False, "reason": "no BatteryState topic discovered (missing)"})
+
+        if self._requires("joint_states"):
+            joint = self.node.joint_state_cached()
+            if joint.get("available"):
+                if joint.get("age_s", 999) > self.max_joint_age_s:
+                    allow = False
+                    checks.append({"check": "joint_states_fresh", "ok": False, "reason": f"/joint_states stale: {joint['age_s']}s"})
+                else:
+                    checks.append({"check": "joint_states_fresh", "ok": True, "age_s": joint["age_s"]})
+            else:
+                allow = False
+                checks.append({"check": "joint_states", "ok": False, "reason": "no /joint_states evidence (missing)"})
 
         return {"allow": allow, "checks": checks}
 
@@ -320,21 +337,25 @@ TEST_CATALOG = {
         "name": "Standard diagnostics health",
         "description": "Inspect /diagnostics and fail on ERROR/STALE; WARN remains warning.",
         "writes": False,
+        "requires": "diagnostics",
     },
     "battery_health": {
         "name": "Battery health",
         "description": "Inspect the BatteryState topic and check percentage, voltage, freshness and validity.",
         "writes": False,
+        "requires": "battery",
     },
     "joint_states_health": {
         "name": "Joint-state stream health",
         "description": "Sample /joint_states and check freshness, rate, finite values and movement jitter evidence.",
         "writes": False,
+        "requires": "joint_states",
     },
     "ros2_control_health": {
         "name": "ros2_control health",
         "description": "Inspect controller_manager controllers, hardware components and interfaces when available.",
         "writes": False,
+        "requires": "ros2_control",
     },
     "system_health": {
         "name": "Composite system health",
@@ -352,20 +373,48 @@ class TestRunner:
         max_diag_age_s: float = 5.0,
         max_battery_age_s: float = 5.0,
         min_battery_pct: float = 0.10,
+        rdcd: Rdcd | None = None,
     ):
         self.node = node
         self.history = history
         self.max_diag_age_s = max_diag_age_s
         self.max_battery_age_s = max_battery_age_s
         self.min_battery_pct = min_battery_pct
+        self.rdcd = rdcd
 
     @staticmethod
     def _severity(result: str) -> int:
-        return {"PASS": 0, "SKIP": 1, "WARN": 2, "FAIL": 3}.get(result, 3)
+        return {"PASS": 0, "NOT_SUPPORTED": 0, "SKIP": 1, "WARN": 2, "FAIL": 3}.get(result, 3)
+
+    def _requires(self, test_id: str) -> str | None:
+        return TEST_CATALOG[test_id].get("requires")
+
+    def _not_supported(self, test_id: str) -> tuple[str, str, list[dict[str, Any]]] | None:
+        """Return (result, summary, evidence) when a test's capability is not
+        declared by the active RDCD; None when the test is applicable."""
+        req = self._requires(test_id)
+        if req is not None and self.rdcd is not None and not self.rdcd.has(req):
+            summary = f"{req} telemetry is not supported by the {self.rdcd.name} RDCD."
+            return ("NOT_SUPPORTED", summary, [])
+        return None
 
     def run(self, test_id: str) -> dict[str, Any]:
         if test_id not in TEST_CATALOG:
             return {"ok": False, "error": f"unknown test_id: {test_id}", "available": list(TEST_CATALOG)}
+
+        not_supported = self._not_supported(test_id)
+        if not_supported is not None:
+            result, summary, evidence = not_supported
+            tr = TestResult(
+                test_id=test_id,
+                result=result,
+                summary=summary,
+                evidence=evidence,
+                started_at=now_iso(),
+                duration_ms=0,
+            )
+            self.history.add(tr)
+            return {"ok": True, **tr.as_dict()}
 
         started_iso = now_iso()
         started = time.monotonic()
@@ -511,18 +560,31 @@ class TestRunner:
         for sid in sub_ids:
             # Call sub-test methods directly so composite run creates one DB record,
             # rather than recursively writing 5 history entries.
-            result, summary, evidence = getattr(self, f"_test_{sid}")()
+            not_supported = self._not_supported(sid)
+            if not_supported is not None:
+                result, summary, evidence = not_supported
+            else:
+                result, summary, evidence = getattr(self, f"_test_{sid}")()
             sub_results.append({"test_id": sid, "result": result, "summary": summary, "evidence": evidence})
 
-        worst = max(sub_results, key=lambda x: self._severity(x["result"]))["result"]
-        if worst == "FAIL":
-            overall = "FAIL"
-        elif any(x["result"] == "WARN" for x in sub_results):
-            overall = "WARN"
-        else:
+        # Unsupported capabilities (NOT_SUPPORTED) must never drag down the
+        # composite result; only applicable tests participate in aggregation.
+        applicable = [x for x in sub_results if x["result"] != "NOT_SUPPORTED"]
+        if not applicable:
             overall = "PASS"
+        else:
+            worst = max(applicable, key=lambda x: self._severity(x["result"]))["result"]
+            if worst == "FAIL":
+                overall = "FAIL"
+            elif any(x["result"] == "WARN" for x in applicable):
+                overall = "WARN"
+            else:
+                overall = "PASS"
 
-        summary = "; ".join(f"{x['test_id']}={x['result']}" for x in sub_results)
+        summary = "; ".join(
+            f"{x['test_id']}={'N/A' if x['result'] == 'NOT_SUPPORTED' else x['result']}"
+            for x in sub_results
+        )
         return overall, summary, sub_results
 
 

@@ -12,6 +12,8 @@ Capabilities
 - Inspect ros2_control through controller_manager services when available
 - Dynamically snapshot/sample arbitrary ROS topics without hard-coding message types
 - Produce deterministic health tests and persist test history in SQLite
+- Load a Robot Diagnostic Capability Description (RDCD) to restrict diagnostics
+  to a robot's declared capabilities
 - Safety Gate for motion-related extensions
 - Emergency stop fallback: publish zero geometry_msgs/Twist to a configurable cmd_vel topic
 - Optional Trigger-based E-stop service
@@ -34,6 +36,7 @@ Examples
     python3 robodiag_ros2.py --cmd-vel-topic /cmd_vel
     python3 robodiag_ros2.py --controller-manager /controller_manager
     python3 robodiag_ros2.py --estop-service /emergency_stop
+    python3 robodiag_ros2.py --rdcd mini_pupper_2
 
 REPL commands
 -------------
@@ -47,6 +50,7 @@ REPL commands
     /tests
     /run joint_states_health
     /history 10
+    /rdcd
     /stop
     /quit
 
@@ -111,6 +115,17 @@ from robodiag_core import (
     compact,
     now_iso,
     stats_from_samples,
+)
+
+from robodiag_rdcd import (
+    AVAILABLE,
+    MISSING,
+    NOT_SUPPORTED,
+    TYPE_MISMATCH,
+    Rdcd,
+    RdcdError,
+    capability_status,
+    load_rdcd,
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -406,11 +421,13 @@ class HarnessNode(Node):
         controller_manager: str,
         cmd_vel_topic: str,
         estop_service: str | None,
+        rdcd: Rdcd | None = None,
     ):
         super().__init__("robodiag_harness")
         self.controller_manager = controller_manager.rstrip("/") or "/controller_manager"
         self.cmd_vel_topic = cmd_vel_topic
         self.estop_service = estop_service
+        self.rdcd = rdcd
 
         self._diag_lock = threading.Lock()
         self._diag_status: dict[str, dict[str, Any]] = {}
@@ -452,18 +469,23 @@ class HarnessNode(Node):
 
     def _ensure_common_subscriptions(self) -> None:
         topics = self._topic_type_map()
-        if self.battery_sub is None:
-            candidates = [
-                name
-                for name, types in topics.items()
-                if "sensor_msgs/msg/BatteryState" in types
-            ]
-            if candidates:
-                # Prefer the conventional name if present.
-                topic = "/battery_state" if "/battery_state" in candidates else candidates[0]
-                self.battery_sub = self.create_subscription(
-                    BatteryState, topic, self._on_battery, self.sensor_qos
-                )
+        # Battery telemetry is only searched for when the active RDCD declares a
+        # battery capability (or in generic mode, where we auto-discover). A
+        # robot whose RDCD has no battery capability must not trigger battery
+        # subscription or be treated as missing battery data.
+        if self.rdcd is None or self.rdcd.has("battery"):
+            if self.battery_sub is None:
+                candidates = [
+                    name
+                    for name, types in topics.items()
+                    if "sensor_msgs/msg/BatteryState" in types
+                ]
+                if candidates:
+                    # Prefer the conventional name if present.
+                    topic = "/battery_state" if "/battery_state" in candidates else candidates[0]
+                    self.battery_sub = self.create_subscription(
+                        BatteryState, topic, self._on_battery, self.sensor_qos
+                    )
         if self.joint_sub is None and "/joint_states" in topics:
             if "sensor_msgs/msg/JointState" in topics["/joint_states"]:
                 self.joint_sub = self.create_subscription(
@@ -744,6 +766,8 @@ class HarnessNode(Node):
 
     # ── Common cached health evidence ────────────────────────────────────────
     def battery_state(self) -> dict[str, Any]:
+        if self.rdcd is not None and not self.rdcd.has("battery"):
+            return {"available": False, "not_supported": True, "robot": self.rdcd.name}
         self._ensure_common_subscriptions()
         with self._battery_lock:
             if self._last_battery is None:
@@ -1459,6 +1483,7 @@ _LANG: dict[str, dict[str, str]] = {
         "battery_pct": "Battery: {pct}",
         "battery_v": "Battery voltage: {v} V",
         "battery_unavailable": "Battery: unavailable (no BatteryState received)",
+        "battery_not_supported": "Battery telemetry is not supported by the {robot} RDCD.",
         "diag_no_data": "No /diagnostics data received.",
         "diag_errors": "{n} ERROR/STALE status(es):",
         "diag_warns": "{n} WARN status(es):",
@@ -1495,6 +1520,7 @@ _LANG: dict[str, dict[str, str]] = {
         "battery_pct": "电量：{pct}",
         "battery_v": "电池电压：{v} V",
         "battery_unavailable": "电量：不可用（未收到 BatteryState）",
+        "battery_not_supported": "{robot} 的 RDCD 不支持电量遥测。",
         "diag_no_data": "未收到 /diagnostics 数据。",
         "diag_errors": "{n} 个 ERROR/STALE 状态：",
         "diag_warns": "{n} 个 WARN 状态：",
@@ -1539,6 +1565,8 @@ def _t(lang: str, key: str, **kwargs: Any) -> str:
 
 
 def _fmt_battery(state: dict[str, Any], lang: str = "en") -> str:
+    if state.get("not_supported"):
+        return _t(lang, "battery_not_supported", robot=state.get("robot", ""))
     pct = state.get("percentage")
     voltage = state.get("voltage")
     if pct is not None and voltage is not None:
@@ -1825,6 +1853,7 @@ HELP = f"""[bold]RoboDiag ROS 2 Harness v{VERSION}[/bold]
   /history \[n]                  Recent n test runs
   /safety                        Show the motion Safety Gate
   /stop                          Software stop: zero cmd_vel + optional Trigger service
+  /rdcd                          Show the robot's diagnostic capabilities (RDCD)
   /jev                           Show Jev (System 1) routing status
   /help                          Help
   /quit                          Quit
@@ -1854,6 +1883,7 @@ REPL_COMMANDS: list[tuple[str, str]] = [
     ("/history", "Recent test runs"),
     ("/safety", "Show the motion Safety Gate"),
     ("/stop", "Software stop (zero cmd_vel + optional Trigger)"),
+    ("/rdcd", "Show the robot's diagnostic capabilities (RDCD)"),
     ("/jev", "Show Jev (System 1) routing status"),
     ("/quit", "Quit"),
 ]
@@ -1993,10 +2023,14 @@ def print_diagnostics(d: dict[str, Any]) -> None:
 
 def print_test(result: dict[str, Any]) -> None:
     status = result.get("result", "?")
-    color = {"PASS": "green", "WARN": "yellow", "FAIL": "red", "SKIP": "cyan"}.get(status, "white")
+    if status == "NOT_SUPPORTED":
+        display, color = "N/A", "dim"
+    else:
+        display = status
+        color = {"PASS": "green", "WARN": "yellow", "FAIL": "red", "SKIP": "cyan"}.get(status, "white")
     console.print(
         Panel(
-            f"[{color}][bold]{status}[/bold][/{color}]  {result.get('summary', '')}\n"
+            f"[{color}][bold]{display}[/bold][/{color}]  {result.get('summary', '')}\n"
             f"[dim]{result.get('test_id', '')} · {result.get('duration_ms', '?')} ms[/dim]",
             border_style=color,
             title="Diagnostic Test",
@@ -2029,6 +2063,50 @@ def print_sample(s: dict[str, Any], max_rows: int = 30) -> None:
     console.print(t)
     if len(stats) > max_rows:
         console.print(f"[dim]Showing only the first {max_rows}/{len(stats)} numeric fields.[/dim]")
+
+
+def print_rdcd(rdcd: Rdcd | None, topic_types: dict[str, list[str]]) -> None:
+    """Show what the active RDCD declares as supported vs not supported.
+
+    Declared capabilities are validated against the live topic graph
+    (AVAILABLE / MISSING / TYPE_MISMATCH). Capabilities the test catalog relies
+    on but the RDCD does not declare are listed as "not supported".
+    """
+    if rdcd is None:
+        console.print(
+            "[yellow]No RDCD selected (generic mode). "
+            "Start with --rdcd to load robot-specific capabilities.[/yellow]"
+        )
+        return
+
+    console.print(f"[bold]RDCD: {rdcd.name}[/bold]")
+    console.print(f"[dim]robot id: {rdcd.robot_id}[/dim]")
+
+    console.print("\n[bold]Supported capabilities[/bold]\n")
+    for cap_name in rdcd.declared():
+        cap = rdcd.get(cap_name)
+        status = capability_status(rdcd, cap_name, topic_types)
+        if status == AVAILABLE:
+            console.print(f"  [green]✓[/green] {cap_name}\n     [dim]{cap.topic}[/dim]")
+        elif status == MISSING:
+            console.print(
+                f"  [red]✗[/red] {cap_name}\n"
+                f"     [dim]expected: {cap.topic}[/dim]\n"
+                f"     [yellow]status: MISSING[/yellow]"
+            )
+        else:  # TYPE_MISMATCH
+            console.print(
+                f"  [red]✗[/red] {cap_name}\n"
+                f"     [dim]expected: {cap.topic} ({cap.message_type})[/dim]\n"
+                f"     [yellow]status: TYPE_MISMATCH[/yellow]"
+            )
+
+    required = {spec.get("requires") for spec in TEST_CATALOG.values() if spec.get("requires")}
+    unsupported = sorted(required - set(rdcd.declared()))
+    if unsupported:
+        console.print("\n[bold]Not supported[/bold]\n")
+        for name in unsupported:
+            console.print(f"  — {name}")
 
 
 def confirm_stop() -> bool:
@@ -2143,10 +2221,14 @@ def repl(
                 for c in ("ID", "Time", "Test", "Result", "Duration", "Summary"):
                     t.add_column(c, overflow="fold")
                 for row in rows:
-                    color = {"PASS": "green", "WARN": "yellow", "FAIL": "red", "SKIP": "cyan"}.get(row["result"], "white")
+                    if row["result"] == "NOT_SUPPORTED":
+                        color, display = "dim", "N/A"
+                    else:
+                        color = {"PASS": "green", "WARN": "yellow", "FAIL": "red", "SKIP": "cyan"}.get(row["result"], "white")
+                        display = row["result"]
                     t.add_row(
                         str(row["id"]), row["started_at"], row["test_id"],
-                        f"[{color}]{row['result']}[/]", f"{row['duration_ms']} ms", row["summary"][:90]
+                        f"[{color}]{display}[/]", f"{row['duration_ms']} ms", row["summary"][:90]
                     )
                 console.print(t)
                 continue
@@ -2177,6 +2259,9 @@ def repl(
                     )
                 else:
                     console.print("[yellow]Jev router disabled. Set TYPESAFE_API_KEY to enable System 1 routing.[/yellow]")
+                continue
+            if line == "/rdcd":
+                print_rdcd(node.rdcd, node._topic_type_map())
                 continue
             if line.startswith("/"):
                 console.print(f"[red]Unknown command {line}; type /help for help.[/red]")
@@ -2267,12 +2352,31 @@ def build_llm_client(
         return None, model
 
 
+def resolve_rdcd(arg: str) -> Rdcd | None:
+    """Resolve the --rdcd argument to an Rdcd, or None for generic mode.
+
+    Accepts either a robot id (looked up under ``rdcd/<id>.yaml`` next to this
+    module) or an explicit path to a ``.yaml``/``.yml`` file.
+    """
+    if not arg:
+        return None
+    p = Path(arg)
+    if p.suffix.lower() in (".yaml", ".yml") or p.exists():
+        return load_rdcd(p)
+    return load_rdcd(Path(__file__).resolve().parent / "rdcd" / f"{arg}.yaml")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="RoboDiag ROS 2 Diagnostic Harness")
     parser.add_argument("--controller-manager", default="/controller_manager", help="controller_manager node namespace")
     parser.add_argument("--cmd-vel-topic", default="/cmd_vel", help="fallback software-stop Twist topic")
     parser.add_argument("--estop-service", default="", help="optional std_srvs/Trigger E-stop service")
     parser.add_argument("--db", default=os.environ.get("ROBODIAG_DB", "~/.robodiag_ros2.db"))
+    parser.add_argument(
+        "--rdcd",
+        default="",
+        help="robot diagnostic capability description: a robot id (e.g. mini_pupper_2) or a path to an RDCD YAML file",
+    )
     parser.add_argument("--model", default="", help="LLM model name; overrides DEEPSEEK_MODEL")
     parser.add_argument("--base-url", default="", help="OpenAI-compatible base URL; overrides DEEPSEEK_BASE_URL")
     parser.add_argument(
@@ -2287,6 +2391,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--jev-api-key-file", default="", help="read the TypeSafe API key from a file (safer than --jev-api-key)")
     args, ros_unknown = parser.parse_known_args(argv)
 
+    try:
+        rdcd = resolve_rdcd(args.rdcd)
+    except RdcdError as exc:
+        print(f"robodiag: {exc}", file=sys.stderr)
+        return 2
+
     play_banner()
 
     # Pass ROS-specific args through to rclpy; our own args were already parsed.
@@ -2298,6 +2408,7 @@ def main(argv: list[str] | None = None) -> int:
         controller_manager=args.controller_manager,
         cmd_vel_topic=args.cmd_vel_topic,
         estop_service=args.estop_service or None,
+        rdcd=rdcd,
     )
 
     executor = MultiThreadedExecutor(num_threads=4)
@@ -2317,6 +2428,7 @@ def main(argv: list[str] | None = None) -> int:
         max_diag_age_s=env_float("ROBODIAG_MAX_DIAG_AGE_S", 5.0),
         max_joint_age_s=env_float("ROBODIAG_MAX_JOINT_STATE_AGE_S", 1.0),
         max_battery_age_s=env_float("ROBODIAG_MAX_BATTERY_AGE_S", 5.0),
+        rdcd=rdcd,
     )
     runner = TestRunner(
         node,
@@ -2324,6 +2436,7 @@ def main(argv: list[str] | None = None) -> int:
         max_diag_age_s=env_float("ROBODIAG_MAX_DIAG_AGE_S", 5.0),
         max_battery_age_s=env_float("ROBODIAG_MAX_BATTERY_AGE_S", 5.0),
         min_battery_pct=env_float("ROBODIAG_MIN_BATTERY_PCT", 0.10),
+        rdcd=rdcd,
     )
     runtime = AgentRuntime(node, runner, history_store, gate)
 

@@ -1,0 +1,27 @@
+schema_version: 0.1
+
+robot:
+  id: mini_pupper_2
+  name: Mini Pupper 2
+
+capabilities:
+
+  diagnostics:
+    topic: /diagnostics
+    message_type: diagnostic_msgs/msg/DiagnosticArray
+
+  joint_states:
+    topic: /joint_states
+    message_type: sensor_msgs/msg/JointState
+
+  imu:
+    topic: /imu/data
+    message_type: sensor_msgs/msg/Imu
+
+  odometry:
+    topic: /odom
+    message_type: nav_msgs/msg/Odometry
+
+  velocity_command:
+    topic: /cmd_vel
+    message_type: geometry_msgs/msg/Twist

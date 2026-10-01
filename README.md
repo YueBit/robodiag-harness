@@ -116,6 +116,38 @@ bash ./robodiag \
 Use the names provided by your robot's software. Specifying a name does not
 create the corresponding topic or service.
 
+## Robot Diagnostic Capability Description (RDCD)
+
+RDCD (Robot Diagnostic Capability Description) tells RoboDiag which diagnostic
+capabilities are supported for a robot and how each maps to that robot's ROS 2
+interfaces. The robot does not generate RDCD; it is RoboDiag-authored,
+robot-specific diagnostic knowledge.
+
+A capability can be:
+
+- **declared** — the RDCD states the robot supports it and maps it to a topic.
+  If a declared topic/type is missing at runtime, that is a real finding.
+- **not declared** — diagnostics for that capability do not apply, are reported
+  as `N/A`, and do not affect overall health.
+
+Select an RDCD with `--rdcd` (a robot id or a path to a YAML file), and inspect
+it with the `/rdcd` command:
+
+```bash
+bash ./robodiag --rdcd mini_pupper_2
+```
+
+Without `--rdcd`, RoboDiag runs in generic mode and auto-discovers interfaces
+as before.
+
+### Mini Pupper 2 (reference robot)
+
+Mini Pupper 2 is the first RDCD reference robot. Because Mini Pupper 2 does not
+expose battery telemetry to RoboDiag, its RDCD does not declare a battery
+capability — battery diagnostics are therefore reported as `N/A` rather than
+treated as missing or faulty, and the motion Safety Gate does not require
+battery evidence for it.
+
 ## Using it with an AI assistant
 
 An AI assistant can use diagnostic tools to collect information and help
@@ -281,6 +313,7 @@ pip install -e ".[all]"
 /history [n]                   Recent n test runs
 /safety                        Show the motion Safety Gate
 /stop                          Software stop: zero cmd_vel + optional Trigger service
+/rdcd                          Show the robot's diagnostic capabilities (RDCD)
 /help /quit
 ```
 
@@ -296,6 +329,7 @@ requires `DEEPSEEK_API_KEY` for the final explanation).
 | `--cmd-vel-topic` | `/cmd_vel` | topic used by the software stop |
 | `--estop-service` | *(none)* | optional `std_srvs/Trigger` E-stop service |
 | `--db` | `~/.robodiag_ros2.db` | SQLite history path |
+| `--rdcd` | *(none)* | robot id (e.g. `mini_pupper_2`) or path to an RDCD YAML file |
 | `--model` | `deepseek-chat` | LLM model; overrides `DEEPSEEK_MODEL` |
 | `--base-url` | `https://api.deepseek.com` | OpenAI-compatible base URL |
 | `--api-key` | *(none)* | LLM API key (visible in `ps`/shell history) |
@@ -465,6 +499,10 @@ is used as the fallback. The `/jev` command shows which router is active.
 | `system_health` | Composite of the five tests above | Worst sub-result |
 
 > `battery_health` is unit-tested but not yet verified on physical robot hardware.
+>
+> With an RDCD, a test whose capability is not declared (e.g. battery on Mini
+> Pupper 2) is reported as `N/A` and excluded from `system_health`; a declared
+> capability that is missing at runtime remains a real finding.
 
 Every run is written to SQLite and can be inspected with `/history` or the
 `query_history` tool.
