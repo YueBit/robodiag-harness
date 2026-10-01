@@ -222,6 +222,10 @@ Capabilities that are not declared by the RDCD are considered not supported for 
 
 Any other input can be handled as natural language when the corresponding AI configuration is available.
 
+Slash-command results are fed back into the next natural-language turn, so you
+can run `/check` and then ask the agent about what it reported without
+repeating yourself.
+
 Examples:
 
 ```text
