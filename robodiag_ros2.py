@@ -2129,6 +2129,39 @@ def confirm_stop() -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# REPL → AI context hand-off
+# ──────────────────────────────────────────────────────────────────────────────
+_REPL_ACTIVITY_CAP = 20
+
+
+def _note_repl_activity(activity: list[str], text: str) -> None:
+    """Append a one-line REPL result summary, keeping only the most recent."""
+    activity.append(text)
+    if len(activity) > _REPL_ACTIVITY_CAP:
+        del activity[: len(activity) - _REPL_ACTIVITY_CAP]
+
+
+def _repl_context_block(activity: list[str]) -> str:
+    """Render recent REPL activity as a block to inject into the AI context."""
+    if not activity:
+        return ""
+    lines = "\n".join(f"- {x}" for x in activity)
+    return (
+        "\n\nRecent REPL command results (run by the operator, not tool calls):\n"
+        f"{lines}"
+    )
+
+
+def _messages_with_context(
+    chat_history: list[dict[str, Any]], line: str, activity: list[str]
+) -> list[dict[str, Any]]:
+    """Classic-agent messages with the latest REPL activity folded into the
+    system prompt, while keeping the accumulated dialogue intact."""
+    system_msg = {"role": "system", "content": SYSTEM_PROMPT + _repl_context_block(activity)}
+    return [system_msg, *chat_history[1:], {"role": "user", "content": line}]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # REPL
 # ──────────────────────────────────────────────────────────────────────────────
 def repl(
@@ -2143,6 +2176,7 @@ def repl(
     request_router: RequestRouter | None,
 ) -> None:
     chat_history: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    repl_activity: list[str] = []
     console.print(HELP)
 
     prompt_session = _make_prompt_session(node)
@@ -2167,20 +2201,32 @@ def repl(
                 console.print(HELP)
                 continue
             if line == "/graph":
-                print_graph(node.inspect_graph())
+                g = node.inspect_graph()
+                print_graph(g)
+                _note_repl_activity(
+                    repl_activity,
+                    f"/graph → {g['summary']['nodes']} nodes · {g['summary']['topics']} topics · {g['summary']['services']} services",
+                )
                 continue
             if line == "/diagnostics":
-                print_diagnostics(node.get_diagnostics(include_ok=True))
+                d = node.get_diagnostics(include_ok=True)
+                print_diagnostics(d)
+                if d.get("available"):
+                    _note_repl_activity(repl_activity, f"/diagnostics → {len(d.get('statuses', []))} status(es)")
+                else:
+                    _note_repl_activity(repl_activity, "/diagnostics → no data received")
                 continue
             if line == "/control":
                 with console.status("[bold #00E5FF]Reading controller_manager…[/bold #00E5FF]"):
                     c = node.inspect_ros2_control()
                 print_control(c)
+                _note_repl_activity(repl_activity, "/control → " + ("ros2_control reachable" if c.get("available") else "ros2_control unavailable"))
                 continue
             if line == "/check":
                 with console.status("[bold #00E5FF]Running composite diagnostics…[/bold #00E5FF]"):
                     result = runner.run("system_health")
                 print_test(result)
+                _note_repl_activity(repl_activity, f"/check → system_health {result.get('result')}: {result.get('summary', '')}")
                 continue
             if line == "/tests":
                 t = Table(title="Diagnostic Test Catalog", border_style="#00E5FF")
@@ -2198,14 +2244,17 @@ def repl(
                     result = runner.run(test_id)
                 if result.get("error"):
                     console.print(f"[red]{result['error']}[/red]")
+                    _note_repl_activity(repl_activity, f"/run {test_id} → error: {result['error']}")
                 else:
                     print_test(result)
+                    _note_repl_activity(repl_activity, f"/run {test_id} → {result.get('result')}: {result.get('summary', '')}")
                 continue
             if line.startswith("/topic "):
                 topic = line.split(maxsplit=1)[1].strip()
                 with console.status(f"[bold #00E5FF]Waiting for {topic}…[/bold #00E5FF]"):
                     result = node.topic_snapshot(topic)
                 console.print_json(json.dumps(result, ensure_ascii=False, default=str))
+                _note_repl_activity(repl_activity, f"/topic {topic} → " + ("snapshot captured" if result.get("ok") else f"{result.get('error', 'failed')}"))
                 continue
             if line.startswith("/sample "):
                 parts = line.split()
@@ -2222,6 +2271,10 @@ def repl(
                 with console.status(f"[bold #00E5FF]Sampling {topic} for {duration}s @ {rate}Hz…[/bold #00E5FF]"):
                     result = node.sample_topic(topic, duration, rate)
                 print_sample(result)
+                if result.get("ok"):
+                    _note_repl_activity(repl_activity, f"/sample {topic} → {result.get('samples')} samples @ {result.get('effective_rate_hz')} Hz")
+                else:
+                    _note_repl_activity(repl_activity, f"/sample {topic} → {result.get('error', 'failed')}")
                 continue
             if line.startswith("/history"):
                 parts = line.split()
@@ -2245,14 +2298,18 @@ def repl(
                         f"[{color}]{display}[/]", f"{row['duration_ms']} ms", row["summary"][:90]
                     )
                 console.print(t)
+                _note_repl_activity(repl_activity, f"/history → {len(rows)} recent run(s)")
                 continue
             if line == "/safety":
-                console.print_json(json.dumps(gate.check_for_motion(), ensure_ascii=False, default=str))
+                result = gate.check_for_motion()
+                console.print_json(json.dumps(result, ensure_ascii=False, default=str))
+                _note_repl_activity(repl_activity, f"/safety → allow={result.get('allow')}")
                 continue
             if line == "/stop":
                 if confirm_stop():
                     result = node.emergency_stop()
                     console.print_json(json.dumps(result, ensure_ascii=False, default=str))
+                    _note_repl_activity(repl_activity, "/stop → software stop requested")
                 continue
             if line == "/jev":
                 if jev_router is not None and request_router is not None:
@@ -2276,6 +2333,7 @@ def repl(
                 continue
             if line == "/rdcd":
                 print_rdcd(node.rdcd, node._topic_type_map())
+                _note_repl_activity(repl_activity, f"/rdcd → {node.rdcd.name if node.rdcd else 'generic mode'}")
                 continue
             if line.startswith("/rdcd "):
                 arg = line.split(maxsplit=1)[1].strip()
@@ -2293,8 +2351,10 @@ def repl(
                 node._ensure_common_subscriptions()
                 if new_rdcd is None:
                     console.print("[green]RDCD cleared — generic mode.[/green]")
+                    _note_repl_activity(repl_activity, "/rdcd → cleared (generic mode)")
                 else:
                     console.print(f"[green]RDCD switched to {new_rdcd.name}.[/green]")
+                    _note_repl_activity(repl_activity, f"/rdcd → switched to {new_rdcd.name}")
                 print_rdcd(node.rdcd, node._topic_type_map())
                 continue
             if line.startswith("/"):
@@ -2335,13 +2395,17 @@ def repl(
                         runtime,
                         llm_client,
                         model,
-                        chat_history + [{"role": "user", "content": line}],
+                        _messages_with_context(chat_history, line, repl_activity),
                     )
                     continue
                 if llm_client is None:
                     console.print("[red]Jev router is on, but the LLM explainer is not. Set DEEPSEEK_API_KEY to enable the final diagnosis.[/red]")
                     continue
-                run_jev_diagnosis(runtime, jev_router, llm_client, model, line, lang=lang)
+                run_jev_diagnosis(
+                    runtime, jev_router, llm_client, model,
+                    line + _repl_context_block(repl_activity),
+                    lang=lang,
+                )
                 continue
 
             # No Jev request router: preserve the classic LLM function-calling agent.
@@ -2352,7 +2416,7 @@ def repl(
                 runtime,
                 llm_client,
                 model,
-                chat_history + [{"role": "user", "content": line}],
+                _messages_with_context(chat_history, line, repl_activity),
             )
 
         except KeyboardInterrupt:
