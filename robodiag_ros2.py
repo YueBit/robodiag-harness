@@ -1891,15 +1891,17 @@ REPL_COMMANDS: list[tuple[str, str]] = [
 if _HAVE_PROMPT_TOOLKIT:
 
     class SlashCommandCompleter(Completer):
-        """Live dropdown for slash commands, topic names and test ids."""
+        """Live dropdown for slash commands, topic names, test ids and RDCD ids."""
 
         def __init__(
             self,
             topic_provider: Callable[[], list[str]],
             test_provider: Callable[[], dict[str, Any]],
+            rdcd_provider: Callable[[], list[str]],
         ) -> None:
             self._topic_provider = topic_provider
             self._test_provider = test_provider
+            self._rdcd_provider = rdcd_provider
 
         def get_completions(self, document: Any, complete_event: Any):
             stripped = document.text_before_cursor.lstrip()
@@ -1948,6 +1950,15 @@ if _HAVE_PROMPT_TOOLKIT:
                             display=test_id,
                             display_meta=str(spec.get("name", "")),
                         )
+            elif command == "/rdcd":
+                for choice in self._rdcd_provider():
+                    if choice.startswith(fragment):
+                        yield Completion(
+                            choice,
+                            start_position=-len(fragment),
+                            display=choice,
+                            display_meta="generic mode" if choice == "off" else "RDCD robot id",
+                        )
 
 
 def _make_prompt_session(node: HarnessNode) -> Any | None:
@@ -1967,10 +1978,13 @@ def _make_prompt_session(node: HarnessNode) -> Any | None:
             topic_cache["at"] = now
         return topic_cache["items"]
 
+    def rdcd_provider() -> list[str]:
+        return ["off", *list_rdcd_ids()]
+
     try:
         return PromptSession(
             message=_ANSI("\n\x1b[1;38;5;45mros2 ❯ \x1b[0m"),
-            completer=SlashCommandCompleter(topic_provider, lambda: TEST_CATALOG),
+            completer=SlashCommandCompleter(topic_provider, lambda: TEST_CATALOG, rdcd_provider),
             complete_while_typing=True,
             history=FileHistory(str(Path.home() / ".robodiag_ros2_history")),
             auto_suggest=AutoSuggestFromHistory(),
@@ -2370,6 +2384,14 @@ def build_llm_client(
     except Exception as exc:  # noqa: BLE001
         console.print(f"[yellow]AI Agent initialization failed; disabled: {type(exc).__name__}: {exc}[/yellow]")
         return None, model
+
+
+def list_rdcd_ids() -> list[str]:
+    """List available RDCD robot ids (the stem of each rdcd/*.yaml file)."""
+    rdcd_dir = Path(__file__).resolve().parent / "rdcd"
+    if not rdcd_dir.is_dir():
+        return []
+    return sorted(p.stem for p in rdcd_dir.glob("*.yaml"))
 
 
 def resolve_rdcd(arg: str) -> Rdcd | None:
