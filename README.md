@@ -464,6 +464,8 @@ is used as the fallback. The `/jev` command shows which router is active.
 | `ros2_control_health` | `controller_manager` controllers, hardware, interfaces | `SKIP` if unavailable; `FAIL` if hardware is not active |
 | `system_health` | Composite of the five tests above | Worst sub-result |
 
+> `battery_health` is unit-tested but not yet verified on physical robot hardware.
+
 Every run is written to SQLite and can be inspected with `/history` or the
 `query_history` tool.
 
