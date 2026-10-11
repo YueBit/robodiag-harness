@@ -1814,9 +1814,17 @@ def handle_chat(llm_client: Any | None, model: str, text: str, lang: str = "en")
         return
     language_hint = LANGUAGE_NAMES.get(lang)
     system = (
-        "You are a concise robot assistant. Reply in the same language as the "
-        "user; if the user's language is unclear, reply in English. "
-        "Keep answers short and do not invent telemetry."
+        f"You are RoboDiag ROS 2, a diagnostic agent that helps the operator "
+        f"test and diagnose the robot (v{VERSION}). You can inspect the ROS 2 "
+        "graph, /diagnostics, ros2_control, and topics such as battery, IMU and "
+        "joint states, run read-only tests, and explain faults. "
+        "This is a lightweight chat turn with no tools and no live telemetry, "
+        "so never invent or guess the robot's current state; when a question "
+        "needs real data, point the operator to the right command "
+        "(e.g. /check, /diagnostics, /control, /topic <topic>, /run <test_id>) "
+        "instead of making up values. "
+        "Reply in the same language as the user; if the user's language is "
+        "unclear, reply in English. Keep answers short and concrete."
     )
     if language_hint and lang != "en":
         system += f" The user's message appears to be in {language_hint}."
@@ -1983,7 +1991,7 @@ def _make_prompt_session(node: HarnessNode) -> Any | None:
 
     try:
         return PromptSession(
-            message=_ANSI("\n\x1b[1;38;5;45mros2 ❯ \x1b[0m"),
+            message=_ANSI("\n\x1b[1;38;5;45mrobodiag ❯ \x1b[0m"),
             completer=SlashCommandCompleter(topic_provider, lambda: TEST_CATALOG, rdcd_provider),
             complete_while_typing=True,
             history=FileHistory(str(Path.home() / ".robodiag_ros2_history")),
@@ -2186,7 +2194,7 @@ def repl(
             if prompt_session is not None:
                 line = prompt_session.prompt().strip()
             else:
-                line = console.input("\n[bold #00E5FF]ros2 ❯ [/bold #00E5FF]").strip()
+                line = console.input("\n[bold #00E5FF]robodiag ❯ [/bold #00E5FF]").strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]Goodbye 🤖[/dim]")
             break
