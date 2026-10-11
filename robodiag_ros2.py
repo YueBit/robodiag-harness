@@ -117,7 +117,9 @@ from robodiag_core import (
     _result_ok,
     build_action_capabilities,
     compact,
+    is_constant_zero,
     now_iso,
+    sample_activity_summary,
     stats_from_samples,
 )
 
@@ -2022,8 +2024,19 @@ def handle_action(
     return False
 
 
-def handle_chat(llm_client: Any | None, model: str, text: str, lang: str = "en") -> None:
-    """Lightweight CHAT: no tools, no telemetry. Uses the LLM only when available."""
+def handle_chat(
+    llm_client: Any | None,
+    model: str,
+    text: str,
+    lang: str = "en",
+    activity: list[str] | None = None,
+) -> None:
+    """Lightweight CHAT: no tools, no live telemetry. Uses the LLM only when available.
+
+    Recent REPL command results are injected as context so a follow-up such as
+    "then what does it mean?" can refer to the `/sample` or `/check` the
+    operator just ran instead of asking them to repeat it.
+    """
     if llm_client is None:
         console.print(_t(lang, "chat_fallback"))
         return
@@ -2033,13 +2046,14 @@ def handle_chat(llm_client: Any | None, model: str, text: str, lang: str = "en")
         f"test and diagnose the robot (v{VERSION}). You can inspect the ROS 2 "
         "graph, /diagnostics, ros2_control, and topics such as battery, IMU and "
         "joint states, run read-only tests, and explain faults. "
-        "This is a lightweight chat turn with no tools and no live telemetry, "
-        "so never invent or guess the robot's current state; when a question "
-        "needs real data, point the operator to the right command "
+        "This is a lightweight chat turn with no tools of its own. Do not invent "
+        "or guess robot state; when a question needs data that is not already "
+        "available, point the operator to the right command "
         "(e.g. /check, /diagnostics, /control, /topic <topic>, /run <test_id>) "
         "instead of making up values. "
         "Reply in the same language as the user; if the user's language is "
         "unclear, reply in English. Keep answers short and concrete."
+        + _repl_context_block(activity or [])
     )
     if language_hint and lang != "en":
         system += f" The user's message appears to be in {language_hint}."
@@ -2295,11 +2309,20 @@ def print_sample(s: dict[str, Any], max_rows: int = 30) -> None:
     stats = s.get("statistics", {})
     # Prefer derived/named fields over verbose header timestamps.
     ordered = sorted(stats.items(), key=lambda kv: (0 if "_joints" in kv[0] or "_orientation" in kv[0] else 1, kv[0]))
-    for path, v in ordered[:max_rows]:
+    visible = [(path, v) for path, v in ordered if not is_constant_zero(v)]
+    hidden_zero = len(ordered) - len(visible)
+    if not visible:  # every field is constant zero; show them so the table is not empty
+        visible, hidden_zero = ordered, 0
+    for path, v in visible[:max_rows]:
         t.add_row(path, str(v["min"]), str(v["max"]), str(v["mean"]), str(v["std"]), str(v["range"]))
     console.print(t)
-    if len(stats) > max_rows:
-        console.print(f"[dim]Showing only the first {max_rows}/{len(stats)} numeric fields.[/dim]")
+    notes = []
+    if len(visible) > max_rows:
+        notes.append(f"showing first {max_rows}/{len(visible)} varying fields")
+    if hidden_zero:
+        notes.append(f"{hidden_zero} constant/zero field(s) hidden")
+    if notes:
+        console.print(f"[dim]{'; '.join(notes)}.[/dim]")
 
 
 def print_rdcd(rdcd: Rdcd | None, topic_types: dict[str, list[str]]) -> None:
@@ -2494,10 +2517,7 @@ def repl(
                 with console.status(f"[bold #00E5FF]Sampling {topic} for {duration}s @ {rate}Hz…[/bold #00E5FF]"):
                     result = node.sample_topic(topic, duration, rate)
                 print_sample(result)
-                if result.get("ok"):
-                    _note_repl_activity(repl_activity, f"/sample {topic} → {result.get('samples')} samples @ {result.get('effective_rate_hz')} Hz")
-                else:
-                    _note_repl_activity(repl_activity, f"/sample {topic} → {result.get('error', 'failed')}")
+                _note_repl_activity(repl_activity, sample_activity_summary(result))
                 continue
             if line.startswith("/history"):
                 parts = line.split()
@@ -2606,7 +2626,7 @@ def repl(
                     route = RequestRoute(mode=RequestMode.DIAGNOSIS)
 
                 if route.mode is RequestMode.CHAT:
-                    handle_chat(llm_client, model, line, lang=lang)
+                    handle_chat(llm_client, model, line, lang=lang, activity=repl_activity)
                     continue
 
                 # DIAGNOSIS — the existing Jev evidence loop + LLM explainer.

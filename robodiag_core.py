@@ -132,6 +132,50 @@ def stats_from_samples(samples: list[dict[str, Any]]) -> dict[str, dict[str, flo
     return result
 
 
+def is_constant_zero(v: dict[str, Any]) -> bool:
+    """True when every statistic is zero (e.g. unused covariance entries)."""
+    for key in ("min", "max", "mean", "std", "range"):
+        try:
+            if float(v.get(key) or 0.0) != 0.0:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def sample_activity_summary(result: dict[str, Any]) -> str:
+    """One-line /sample recap for the AI context, with a few varying fields.
+
+    A bare "N samples @ X Hz" is not enough for a follow-up question such as
+    "then what does it mean?"; include the most variable numeric fields so the
+    answer can refer to actual values.
+    """
+    topic = result.get("topic", "?")
+    if not result.get("ok"):
+        return f"/sample {topic} → {result.get('error', 'failed')}"
+    base = (
+        f"/sample {topic} → {result.get('samples')} samples @ "
+        f"{result.get('effective_rate_hz')} Hz"
+    )
+    stats = result.get("statistics", {}) or {}
+    varying = []
+    for path, v in stats.items():
+        try:
+            span = max(abs(float(v.get("range") or 0.0)), abs(float(v.get("std") or 0.0)))
+        except (TypeError, ValueError):
+            continue
+        if span > 0:
+            varying.append((span, path, v))
+    varying.sort(key=lambda item: item[0], reverse=True)
+    if varying:
+        digest = "; ".join(
+            f"{path} mean={v.get('mean')} range={v.get('range')}"
+            for _, path, v in varying[:6]
+        )
+        base += f"; most variable: {digest}"
+    return base
+
+
 def _result_ok(result: str) -> bool:
     """A tool call counts as meaningful evidence only if it produced a result.
 

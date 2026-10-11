@@ -131,6 +131,31 @@ class TestPureHelpers(unittest.TestCase):
         self.assertEqual(stats["a"]["mean"], 2.0)
         self.assertEqual(stats["b.c"]["range"], 2.0)
 
+    def test_is_constant_zero(self):
+        self.assertTrue(core.is_constant_zero({"min": 0.0, "max": 0, "mean": 0.0, "std": 0.0, "range": 0.0}))
+        self.assertFalse(core.is_constant_zero({"min": 0.0, "max": 1.0, "mean": 0.5, "std": 0.1, "range": 1.0}))
+        self.assertFalse(core.is_constant_zero({"min": 5.0, "max": 5.0, "mean": 5.0, "std": 0.0, "range": 0.0}))
+        self.assertFalse(core.is_constant_zero({"min": "n/a"}))
+
+    def test_sample_activity_summary(self):
+        result = {
+            "ok": True,
+            "topic": "/odom",
+            "samples": 24,
+            "effective_rate_hz": 4.8,
+            "statistics": {
+                "pose.covariance[0]": {"min": 1.0, "max": 9.0, "mean": 5.0, "std": 2.0, "range": 8.0},
+                "pose.covariance[1]": {"min": 0.0, "max": 0.0, "mean": 0.0, "std": 0.0, "range": 0.0},
+            },
+        }
+        summary = core.sample_activity_summary(result)
+        self.assertIn("/odom", summary)
+        self.assertIn("24 samples @ 4.8 Hz", summary)
+        self.assertIn("pose.covariance[0]", summary)
+        self.assertNotIn("pose.covariance[1]", summary)  # constant zero is not "variable"
+        failed = core.sample_activity_summary({"ok": False, "topic": "/odom", "error": "timeout"})
+        self.assertIn("timeout", failed)
+
     def test_result_ok_semantics(self):
         # A completed FAIL test is meaningful evidence.
         self.assertTrue(
