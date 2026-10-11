@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 import threading
 import time
@@ -174,6 +175,24 @@ def sample_activity_summary(result: dict[str, Any]) -> str:
         )
         base += f"; most variable: {digest}"
     return base
+
+
+_VERIFY_WORD_RE = re.compile(r"\bverif\w*", re.IGNORECASE)
+_VERIFY_CONTINUE_RE = re.compile(
+    r"\b(?:continue|keep|more|further|again|go on|yes)\b", re.IGNORECASE
+)
+
+
+def is_verify_request(text: str) -> bool:
+    """True when the operator is asking to continue diagnostic verification.
+
+    Matches explicit forms such as ``/verify`` or ``continue verify`` without
+    treating a fresh request like "verify the battery" as a continuation.
+    """
+    low = (text or "").strip().lower().rstrip("?!. ")
+    if low in ("/verify", "verify", "verify all", "/verify all"):
+        return True
+    return bool(_VERIFY_WORD_RE.search(low)) and bool(_VERIFY_CONTINUE_RE.search(low))
 
 
 def _result_ok(result: str) -> bool:

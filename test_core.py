@@ -137,6 +137,16 @@ class TestPureHelpers(unittest.TestCase):
         self.assertFalse(core.is_constant_zero({"min": 5.0, "max": 5.0, "mean": 5.0, "std": 0.0, "range": 0.0}))
         self.assertFalse(core.is_constant_zero({"min": "n/a"}))
 
+    def test_is_verify_request(self):
+        self.assertTrue(core.is_verify_request("/verify"))
+        self.assertTrue(core.is_verify_request("continue verify"))
+        self.assertTrue(core.is_verify_request("Continue to verify, please"))
+        self.assertTrue(core.is_verify_request("verify more"))
+        self.assertTrue(core.is_verify_request("yes, keep verifying"))
+        self.assertFalse(core.is_verify_request("verify the battery"))
+        self.assertFalse(core.is_verify_request("anything wrong with this robot?"))
+        self.assertFalse(core.is_verify_request("run system_health"))
+
     def test_sample_activity_summary(self):
         result = {
             "ok": True,

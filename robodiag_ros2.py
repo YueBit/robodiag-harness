@@ -118,6 +118,7 @@ from robodiag_core import (
     build_action_capabilities,
     compact,
     is_constant_zero,
+    is_verify_request,
     now_iso,
     sample_activity_summary,
     stats_from_samples,
@@ -1412,6 +1413,93 @@ def _record_test_result(state: DiagnosticState, result: str) -> None:
                 pass
 
 
+def _append_tool_result(
+    state: DiagnosticState, tool: str, args: dict[str, Any], result: str
+) -> None:
+    """Record one executed tool call in the diagnostic state."""
+    state.tool_calls.append(
+        ToolCall(tool=tool, args=args, result=result, ok=_result_ok(result))
+    )
+    if tool == "run_test":
+        _record_test_result(state, result)
+
+
+def _counts_from_state(state: DiagnosticState) -> tuple[set[tuple[str, str]], dict[str, int]]:
+    seen: set[tuple[str, str]] = set()
+    tool_counts: dict[str, int] = {}
+    for tc in state.tool_calls:
+        seen.add((tc.tool, json.dumps(tc.args, sort_keys=True, default=str)))
+        tool_counts[tc.tool] = tool_counts.get(tc.tool, 0) + 1
+    return seen, tool_counts
+
+
+def run_verification(
+    runtime: AgentRuntime,
+    llm_client: Any,
+    model: str,
+    state: DiagnosticState,
+    explanation: str,
+    lang: str = "en",
+    rounds: int = _JEV_MAX_VERIFY_ROUNDS,
+) -> tuple[str, bool]:
+    """Run planner-driven verification rounds on an existing diagnosis.
+
+    Returns ``(explanation, more_possible)``. ``more_possible`` is True when a
+    full round of checks ran, so the planner may have further checks to propose;
+    it is False when the planner returned no new measurable checks, meaning the
+    remaining items cannot be resolved with the available read-only tools.
+    """
+    seen, tool_counts = _counts_from_state(state)
+    more_possible = False
+    for _ in range(max(0, rounds)):
+        known_topics = _known_topic_names(runtime.node)
+        try:
+            proposals = plan_verification_with_llm(llm_client, model, state, explanation, lang)
+        except Exception as exc:  # noqa: BLE001 - planning is optional, never fatal
+            console.print(f"[yellow]Verification planning skipped: {type(exc).__name__}: {exc}[/yellow]")
+            return explanation, False
+        checks = validated_verification_checks(proposals, state.tool_calls, TEST_CATALOG, known_topics)
+        if not checks:
+            return explanation, False
+        console.print(
+            Panel(
+                Text(
+                    f"Verification: running {len(checks)} additional read-only check(s)",
+                    style="bold #B388FF",
+                ),
+                border_style="#B388FF",
+                title="Follow-up verification",
+            )
+        )
+        ran_any = False
+        for tool, args in checks:
+            key = (tool, json.dumps(args, sort_keys=True, default=str))
+            if key in seen or tool_counts.get(tool, 0) >= _JEV_MAX_CALLS_PER_TOOL:
+                continue
+            seen.add(key)
+            tool_counts[tool] = tool_counts.get(tool, 0) + 1
+            with console.status(f"[bold #00E5FF]⚡ {tool} {args}", spinner="bouncingBall"):
+                result = runtime.execute(tool, args)
+            console.print(Text(f"  ⚡ {tool} → {_trace_preview(result)}", style="dim"))
+            _append_tool_result(state, tool, args, result)
+            ran_any = True
+        if not ran_any:
+            return explanation, False
+        explanation = explain_with_llm(llm_client, model, state, lang)
+        more_possible = True
+    return explanation, more_possible
+
+
+def _print_diagnosis(explanation: str) -> None:
+    console.print(
+        Panel(
+            Markdown(explanation or "(empty)"),
+            border_style="#7C4DFF",
+            title=f"[bold]🩺 RoboDiag ROS 2 v{VERSION}[/bold]",
+        )
+    )
+
+
 def run_jev_diagnosis(
     runtime: AgentRuntime,
     router: JevRouter,
@@ -1419,7 +1507,7 @@ def run_jev_diagnosis(
     model: str,
     symptom: str,
     lang: str = "en",
-) -> None:
+) -> tuple[DiagnosticState, str, bool]:
     """System 1 routing loop with deterministic gates.
 
     Jev proposes the next action (and whether to finalize), but deterministic
@@ -1447,11 +1535,7 @@ def run_jev_diagnosis(
 
     def record(action: str, args: dict[str, Any], result: str) -> None:
         console.print(Text(f"  ⚡ {action} → {_trace_preview(result)}", style="dim"))
-        state.tool_calls.append(
-            ToolCall(tool=action, args=args, result=result, ok=_result_ok(result))
-        )
-        if action == "run_test":
-            _record_test_result(state, result)
+        _append_tool_result(state, action, args, result)
 
     def forced_args(action: str) -> dict[str, Any] | None:
         """Deterministic arguments for a required check Jev did not choose."""
@@ -1617,7 +1701,7 @@ def run_jev_diagnosis(
 
     if not state.tool_calls and not finalized:
         console.print("[yellow]No evidence was collected; nothing to explain.[/yellow]")
-        return
+        return state, "", False
 
     tests_run = len(state.test_results)
     console.print(
@@ -1631,52 +1715,12 @@ def run_jev_diagnosis(
             title="System 1 → System 2",
         )
     )
-    known_topics = _known_topic_names(runtime.node)
-    explanation = ""
-    for verify_round in range(_JEV_MAX_VERIFY_ROUNDS + 1):
-        explanation = explain_with_llm(llm_client, model, state, lang)
-        if verify_round >= _JEV_MAX_VERIFY_ROUNDS:
-            break
-        try:
-            proposals = plan_verification_with_llm(llm_client, model, state, explanation, lang)
-        except Exception as exc:  # noqa: BLE001 - planning is optional, never fatal
-            console.print(f"[yellow]Verification planning skipped: {type(exc).__name__}: {exc}[/yellow]")
-            break
-        checks = validated_verification_checks(proposals, state.tool_calls, TEST_CATALOG, known_topics)
-        if not checks:
-            break
-        console.print(
-            Panel(
-                Text(
-                    f"Verification round {verify_round + 1}: running {len(checks)} "
-                    "additional read-only check(s)",
-                    style="bold #B388FF",
-                ),
-                border_style="#B388FF",
-                title="Follow-up verification",
-            )
-        )
-        ran_any = False
-        for tool, args in checks:
-            key = (tool, json.dumps(args, sort_keys=True, default=str))
-            if key in seen or tool_counts.get(tool, 0) >= _JEV_MAX_CALLS_PER_TOOL:
-                continue
-            seen.add(key)
-            tool_counts[tool] = tool_counts.get(tool, 0) + 1
-            with console.status(f"[bold #00E5FF]⚡ {tool} {args}", spinner="bouncingBall"):
-                result = runtime.execute(tool, args)
-            record(tool, args, result)
-            ran_any = True
-        if not ran_any:
-            break
-
-    console.print(
-        Panel(
-            Markdown(explanation or "(empty)"),
-            border_style="#7C4DFF",
-            title=f"[bold]🩺 RoboDiag ROS 2 v{VERSION}[/bold]",
-        )
+    explanation = explain_with_llm(llm_client, model, state, lang)
+    explanation, more_possible = run_verification(
+        runtime, llm_client, model, state, explanation, lang, _JEV_MAX_VERIFY_ROUNDS
     )
+    _print_diagnosis(explanation)
+    return state, explanation, more_possible
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2091,6 +2135,7 @@ HELP = f"""[bold]RoboDiag ROS 2 Harness v{VERSION}[/bold]
   /safety                        Show the motion Safety Gate
   /stop                          Software stop: zero cmd_vel + optional Trigger service
   /rdcd [robot|path|off]        Show or switch the active RDCD
+  /verify                        Continue the last diagnosis with more read-only checks
   /jev                           Show Jev (System 1) routing status
   /help                          Help
   /quit                          Quit
@@ -2121,6 +2166,7 @@ REPL_COMMANDS: list[tuple[str, str]] = [
     ("/safety", "Show the motion Safety Gate"),
     ("/stop", "Software stop (zero cmd_vel + optional Trigger)"),
     ("/rdcd", "Show or switch the robot's diagnostic capabilities (RDCD)"),
+    ("/verify", "Continue the last diagnosis with more read-only checks"),
     ("/jev", "Show Jev (System 1) routing status"),
     ("/quit", "Quit"),
 ]
@@ -2423,7 +2469,34 @@ def repl(
 ) -> None:
     chat_history: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
     repl_activity: list[str] = []
+    # The most recent diagnosis, kept so the operator can continue verification
+    # (``/verify`` or "continue verify") without re-running the whole diagnosis.
+    last_verification: tuple[DiagnosticState, str, str] | None = None
     console.print(HELP)
+
+    def handle_verify() -> None:
+        """Continue the most recent diagnosis with another read-only round."""
+        nonlocal last_verification
+        if last_verification is None or llm_client is None:
+            console.print("[yellow]Nothing to continue; run a diagnosis first.[/yellow]")
+            return
+        state, explanation, last_lang = last_verification
+        explanation, more = run_verification(
+            runtime,
+            llm_client,
+            model,
+            state,
+            explanation,
+            lang=last_lang,
+            rounds=_JEV_MAX_VERIFY_ROUNDS,
+        )
+        last_verification = (state, explanation, last_lang)
+        _print_diagnosis(explanation)
+        if more:
+            console.print("[dim]More checks may still be available; run /verify again.[/dim]")
+        else:
+            console.print("[dim]No further read-only checks can be measured for this diagnosis.[/dim]")
+        _note_repl_activity(repl_activity, "/verify → ran another read-only verification round")
 
     prompt_session = _make_prompt_session(node)
 
@@ -2574,6 +2647,9 @@ def repl(
                 else:
                     console.print("[yellow]Jev router disabled. Set TYPESAFE_API_KEY to enable System 1 routing.[/yellow]")
                 continue
+            if line == "/verify":
+                handle_verify()
+                continue
             if line == "/rdcd":
                 print_rdcd(node.rdcd, node._topic_type_map())
                 _note_repl_activity(repl_activity, f"/rdcd → {node.rdcd.name if node.rdcd else 'generic mode'}")
@@ -2602,6 +2678,10 @@ def repl(
                 continue
             if line.startswith("/"):
                 console.print(f"[red]Unknown command {line}; type /help for help.[/red]")
+                continue
+
+            if is_verify_request(line):
+                handle_verify()
                 continue
 
             lang = detect_language(line)
@@ -2644,10 +2724,15 @@ def repl(
                 if llm_client is None:
                     console.print("[red]Jev router is on, but the LLM explainer is not. Set DEEPSEEK_API_KEY to enable the final diagnosis.[/red]")
                     continue
-                run_jev_diagnosis(
+                state, explanation, more = run_jev_diagnosis(
                     runtime, jev_router, llm_client, model,
                     line + _repl_context_block(repl_activity),
                     lang=lang,
+                )
+                last_verification = (state, explanation, lang)
+                console.print(
+                    "\n[bold #B388FF]Continue verification?[/bold #B388FF] "
+                    '[dim]Run /verify (or say "continue verify") for more read-only checks.[/dim]'
                 )
                 continue
 

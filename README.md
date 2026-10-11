@@ -217,12 +217,18 @@ Capabilities that are not declared by the RDCD are considered not supported for 
 /safety                        Show the motion Safety Gate
 /stop                          Request a software stop
 /rdcd [robot|path|off]         Show or switch the active RDCD
+/verify                        Continue the last diagnosis with more read-only checks
 /jev                           Show Jev routing status
 /help                          Help
 /quit                          Quit
 ```
 
 Any other input can be handled as natural language when the corresponding AI configuration is available.
+
+After a diagnosis the agent offers to continue: `/verify` (or saying
+"continue verify") runs another planner-driven round of read-only checks against
+the same diagnosis and prints an updated report. If no further measurable
+checks remain, it says so instead of suggesting work the harness cannot do.
 
 Slash-command results are fed back into the next natural-language turn, so you
 can run `/check` and then ask the agent about what it reported without
