@@ -150,6 +150,117 @@ class DiagnosticState:
     step: int = 0
 
 
+# A diagnosis is not allowed to finalize on inspection alone. Before the LLM
+# explainer is asked to write a conclusion, the loop must have attempted at
+# least one deterministic health test AND at least one live measurement. Each
+# group lists the tools any member of which satisfies that requirement.
+DIAGNOSTIC_REQUIRED_EVIDENCE: tuple[tuple[str, ...], ...] = (
+    ("run_test",),
+    ("sample_topic", "get_topic_snapshot"),
+)
+
+
+def unmet_evidence_requirements(tool_calls: list[ToolCall]) -> list[tuple[str, ...]]:
+    """Return the required-evidence groups that no tool call has attempted yet.
+
+    Satisfaction is based on *attempts*, not successes, so a genuinely
+    unavailable check (for example sampling when no topics exist) does not trap
+    the loop in an unfinalizable state. Callers that need "meaningful evidence"
+    still count successful calls separately.
+    """
+    attempted = {tc.tool for tc in tool_calls}
+    return [
+        group
+        for group in DIAGNOSTIC_REQUIRED_EVIDENCE
+        if not (attempted & set(group))
+    ]
+
+
+# The verification planner may only propose read-only evidence tools. Any other
+# name a model returns is dropped before it can execute.
+VERIFY_ALLOWED_TOOLS: tuple[str, ...] = tuple(sorted(set(JEV_ACTIONS) - {"finalize"}))
+VERIFY_MAX_CHECKS_PER_ROUND = 4
+
+
+def parse_verification_plan(text: str) -> list[Any]:
+    """Extract the ``checks`` list from a planner reply, tolerating code fences.
+
+    The model's reply is untrusted text; this only extracts a list. Every entry
+    still has to pass :func:`validated_verification_checks`.
+    """
+    text = (text or "").strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return []
+    try:
+        data = json.loads(text[start : end + 1])
+    except ValueError:
+        return []
+    checks = data.get("checks") if isinstance(data, dict) else None
+    return checks if isinstance(checks, list) else []
+
+
+def validated_verification_checks(
+    proposals: list[Any],
+    tool_calls: list[ToolCall],
+    test_catalog: dict[str, Any],
+    known_topics: set[str] | None = None,
+    max_checks: int = VERIFY_MAX_CHECKS_PER_ROUND,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Fail-closed validation of a planner's proposed read-only checks.
+
+    Anything not in the read-only allowlist, or whose arguments do not match a
+    known tool shape, is dropped. Already-attempted and duplicate checks are
+    dropped too, so the planner can never re-run the same call or reach a
+    write/motion action.
+    """
+    known_topics = known_topics or set()
+    attempted = {
+        (tc.tool, json.dumps(tc.args, sort_keys=True, default=str)) for tc in tool_calls
+    }
+    out: list[tuple[str, dict[str, Any]]] = []
+    for proposal in proposals:
+        if not isinstance(proposal, dict):
+            continue
+        tool = proposal.get("tool")
+        raw_args = proposal.get("args")
+        args = raw_args if isinstance(raw_args, dict) else {}
+        if tool not in VERIFY_ALLOWED_TOOLS:
+            continue
+        if tool == "run_test":
+            test_id = args.get("test_id")
+            if test_id not in test_catalog or test_catalog[test_id].get("writes"):
+                continue
+            args = {"test_id": test_id}
+        elif tool in ("sample_topic", "get_topic_snapshot"):
+            topic = args.get("topic")
+            if not isinstance(topic, str) or not topic.startswith("/"):
+                continue
+            if known_topics and topic not in known_topics:
+                continue
+            if tool == "sample_topic":
+                args = {"topic": topic, "duration_s": 3.0, "rate_hz": 5.0}
+            else:
+                args = {"topic": topic}
+        elif tool == "get_diagnostics":
+            args = {"include_ok": bool(args.get("include_ok", False))}
+        elif tool == "query_history":
+            try:
+                args = {"limit": max(1, min(int(args.get("limit", 10)), 100))}
+            except (TypeError, ValueError):
+                args = {"limit": 10}
+        else:
+            args = {}
+        key = (tool, json.dumps(args, sort_keys=True, default=str))
+        if key in attempted:
+            continue
+        attempted.add(key)
+        out.append((tool, args))
+        if len(out) >= max_checks:
+            break
+    return out
+
+
 class JevError(RuntimeError):
     pass
 
@@ -255,6 +366,7 @@ class JevRouter:
         state: DiagnosticState,
         allow_finalize: bool = True,
         exclude: set[str] | frozenset[str] | None = None,
+        required: list[str] | None = None,
     ) -> JevDecision:
         criteria: dict[str, str] = dict(JEV_ACTIONS)
         instructions = JEV_NEXT_ACTION_INSTRUCTIONS
@@ -268,6 +380,12 @@ class JevRouter:
                 "the most useful next diagnostic action. Not enough evidence has "
                 "been collected yet, so finalizing is not an option."
             )
+            if required:
+                instructions += (
+                    " The evidence set is still missing these required categories: "
+                    + ", ".join(required)
+                    + ". Choose an action that collects one of them."
+                )
         for name in exclude or ():
             # Budget/repeat exclusions: tools the caller has already exhausted are
             # removed from the allowed set so Jev switches to another tool instead

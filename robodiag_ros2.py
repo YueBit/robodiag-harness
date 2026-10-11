@@ -98,7 +98,11 @@ from robodiag_jev import (
     TYPESAFE_DEFAULT_MODEL,
     TestResult,
     ToolCall,
+    VERIFY_MAX_CHECKS_PER_ROUND,
     detect_language,
+    parse_verification_plan,
+    unmet_evidence_requirements,
+    validated_verification_checks,
 )
 
 from robodiag_core import (
@@ -210,7 +214,18 @@ except ImportError:
 
 VERSION = "0.2.0"
 
+# Set ROBODIAG_VERBOSE=1 to see per-decision routing probabilities and other
+# diagnostic traces. The default keeps the agent output focused on results.
+VERBOSE = os.environ.get("ROBODIAG_VERBOSE", "").strip().lower() not in ("", "0", "false", "no")
+
 console = Console()
+
+
+def _trace_preview(result: str) -> str:
+    """Keep the inline tool trace short by default; full when VERBOSE."""
+    limit = 420 if VERBOSE else 120
+    return result if len(result) <= limit else result[:limit] + " …"
+
 
 BANNER = [
     "██████╗  ██████╗ ██████╗  ██████╗ ██████╗ ██╗ █████╗  ██████╗ ",
@@ -971,7 +986,8 @@ Principles:
 5. When a tool returns ok=false or unavailable, explicitly acknowledge that the evidence is unavailable; do not interpret "no data" as "normal".
 6. emergency_stop is a software-level fallback, not a physical E-stop; if dangerous motion is observed you may call it immediately without user confirmation.
 7. v0.2 has no diagnostic test that actively drives joints; do not claim that you made the robot perform a motion test.
-8. Answer in the same language as the operator (if the language is unclear, reply in English), organized as: symptom → evidence → assessment → possible causes → recommended next checks. Keep it engineering-focused and concise.
+8. Before writing a conclusion, run the read-only checks that would confirm or rule out your leading hypothesis; do not hand the operator checks you could have run yourself. Only list a check as a "recommended next step" if it is genuinely unavailable to you.
+9. Answer in the same language as the operator (if the language is unclear, reply in English), organized as: verdict → confirmed findings → short assessment → suspected causes → genuinely unrun checks. Keep it engineering-focused, under about 250 words, and do not repeat the same evidence in more than one section.
 """
 
 
@@ -1071,8 +1087,7 @@ def agent_turn(runtime: AgentRuntime, client: Any, model: str, messages: list[di
             else:
                 with console.status(f"[bold #00E5FF]⚡ {name} {args}", spinner="bouncingBall"):
                     result = runtime.execute(name, args)
-            preview = result if len(result) <= 420 else result[:420] + " …"
-            console.print(Text(f"  ⚡ {name} → {preview}", style="dim"))
+            console.print(Text(f"  ⚡ {name} → {_trace_preview(result)}", style="dim"))
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
     console.print("[yellow]Reached the tool-call round limit; stopping this agent turn.[/yellow]")
@@ -1103,13 +1118,21 @@ _JEV_TOPIC_HINTS = (
     "current", "voltage", "foot", "leg", "motor",
 )
 _JEV_MAX_TOPIC_OPTIONS = 24
-_JEV_MAX_ROUNDS = 8
+_JEV_MAX_ROUNDS = 10
 _EXPLAINER_EVIDENCE_CHARS = 3000
 
 # Deterministic gates around Jev's routing proposals (see run_jev_diagnosis).
-_JEV_MIN_EVIDENCE_ITEMS = 1   # finalize is withheld until this many successful calls
+# finalize is withheld until this many *successful* calls have been collected,
+# and until every required-evidence group (a deterministic test and a live
+# measurement; see robodiag_jev.DIAGNOSTIC_REQUIRED_EVIDENCE) has been tried.
+_JEV_MIN_EVIDENCE_ITEMS = 3
 _JEV_MAX_CALLS_PER_TOOL = 3   # per-tool budget inside one diagnosis
 _JEV_NONE_TOPIC = "none_of_the_above"  # always offered so Jev is never forced into a bad topic
+
+# After the explainer drafts a diagnosis, it may still list points it could not
+# verify. The verification planner turns those points into read-only tool calls,
+# the harness executes them, and the explainer runs again with the new evidence.
+_JEV_MAX_VERIFY_ROUNDS = 2
 
 def _resolve_jev_settings(
     api_key_override: str | None = None,
@@ -1160,28 +1183,106 @@ def build_request_router(
 EXPLAINER_SYSTEM_PROMPT = f"""You are the RoboDiag ROS 2 Diagnostic Agent v{VERSION} explainer (System 2).
 
 The evidence-gathering phase is complete. You receive the operator's symptom
-and the structured evidence already collected by deterministic tools. Do not
+and the structured results already collected by deterministic tools. Do not
 request more tools.
 
-Write the final diagnosis with this exact structure:
-1. Symptom — restate the reported problem.
-2. Evidence — the measured findings that matter, each attributed to its source.
-3. Assessment — what the evidence directly shows, separating measured facts
-   from inference.
-4. Possible causes — ranked suspected/likely causes. Use "suspected" or
-   "likely"; never claim a "root cause" unless a deterministic test has
-   explicitly confirmed it.
-5. Confirmed findings — only facts established by a deterministic test result.
-   If there are none, say so explicitly.
-6. Recommended next checks — concrete, ordered steps to confirm or rule out the
-   suspected causes.
+Write a short, decisive diagnosis. Keep it under about 250 words and do not
+repeat the same fact in more than one section. Use this exact structure:
+
+**Verdict** — one sentence: what is confirmed and how serious it is.
+**Confirmed** — only findings established by a deterministic test or a measured
+  value, each attributed to its source (test id or topic). If none, write
+  "None confirmed."
+**Assessment** — at most 4 bullets, separating what was measured from what is
+  inferred and marking inference as such.
+**Suspected causes** — a short ranked list, each labeled "suspected" or
+  "likely". Never claim a "root cause" unless a deterministic test confirmed it.
+**Still unverified** — only checks the harness did not run or could not run. If
+  the collected evidence is sufficient, write "None — evidence is sufficient."
 
 Rules:
 - Never invent evidence that is not in the provided records.
-- If the evidence is insufficient, say exactly what is still missing.
-- Keep it engineering-focused and concise. Reply in the same language as the
-  operator's symptom; if the language is unclear, reply in English.
+- If a check's result is already in the evidence, report the result; do not
+  present that check as a recommendation for the operator to run.
+- A test reported as SKIP / NOT_SUPPORTED because the robot does not declare
+  that capability is "not applicable", not an unverified gap.
+- Reply in the same language as the operator's symptom; if it is unclear, reply
+  in English.
 """
+
+
+VERIFY_PLANNER_SYSTEM_PROMPT = f"""You are the RoboDiag verification planner.
+
+A diagnosis has been drafted, but the evidence may still leave some suspected
+causes unconfirmed. Propose at most {VERIFY_MAX_CHECKS_PER_ROUND} read-only
+tool calls that would confirm or rule out those points.
+
+Allowed tools (exact names and argument shapes):
+- inspect_graph {{}}
+- get_diagnostics {{"include_ok": false}}
+- inspect_ros2_control {{}}
+- get_topic_snapshot {{"topic": "/absolute/topic"}}
+- sample_topic {{"topic": "/absolute/topic", "duration_s": 3, "rate_hz": 5}}
+- list_tests {{}}
+- run_test {{"test_id": "<id from the provided catalog>"}}
+- query_history {{"limit": 10}}
+- check_motion_safety {{}}
+
+Rules:
+- Only propose checks that are not already in the provided evidence.
+- Prefer sampling or snapshotting the specific topics named by the draft.
+- Never propose emergency_stop or any motion/write action.
+- If nothing useful can be measured with these tools, return an empty list.
+
+Reply with strict JSON only, no prose and no code fences:
+{{"checks": [{{"tool": "sample_topic", "args": {{"topic": "/imu/data"}}}}]}}
+"""
+
+
+def plan_verification_with_llm(
+    client: Any,
+    model: str,
+    state: DiagnosticState,
+    diagnosis: str,
+    lang: str = "en",
+) -> list[Any]:
+    """Ask the explainer's model which read-only checks would close the gaps.
+
+    The reply is treated as an untrusted proposal: it is only a list of names
+    and arguments, and every entry is re-validated against the deterministic
+    allowlist before it can execute (see validated_verification_checks).
+    """
+    payload = {
+        "symptom": state.symptom,
+        "draft_diagnosis": diagnosis,
+        "checks_already_attempted": [
+            {"tool": tc.tool, "args": tc.args} for tc in state.tool_calls
+        ],
+        "test_catalog": {
+            tid: {"name": spec["name"], "description": spec["description"]}
+            for tid, spec in TEST_CATALOG.items()
+            if not spec.get("writes")
+        },
+    }
+    user = json.dumps(payload, ensure_ascii=False, default=str)
+    with console.status("[bold #7C4DFF]Checking what still needs verification…", spinner="dots"):
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": VERIFY_PLANNER_SYSTEM_PROMPT},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.0,
+        )
+    return parse_verification_plan(resp.choices[0].message.content or "")
+
+
+def _known_topic_names(node: Any) -> set[str]:
+    try:
+        graph = node.inspect_graph()
+    except Exception:  # noqa: BLE001 - absence of a graph must not abort diagnosis
+        return set()
+    return {t.get("name") for t in graph.get("topics", []) if t.get("name")}
 
 
 def explain_with_llm(client: Any, model: str, state: DiagnosticState, lang: str = "en") -> str:
@@ -1216,14 +1317,15 @@ def explain_with_llm(client: Any, model: str, state: DiagnosticState, lang: str 
 
 
 def _print_jev_decision(label: str, decision: JevDecision) -> None:
-    top = sorted(decision.probabilities.items(), key=lambda kv: kv[1], reverse=True)[:3]
-    bits = " · ".join(f"{k} {v:.0%}" for k, v in top)
     console.print(
         Text(f"  🧠 Jev {label}: ", style="bold #B388FF")
         .append(decision.action, style="bold #00E5FF")
         .append(f"   (conf {decision.confidence:.2f} · {decision.model})", style="dim")
     )
-    console.print(Text(f"      {bits}", style="dim"))
+    if VERBOSE:
+        top = sorted(decision.probabilities.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        bits = " · ".join(f"{k} {v:.0%}" for k, v in top)
+        console.print(Text(f"      {bits}", style="dim"))
 
 
 def _safe_jev_decision(label: str, method: Any, *args: Any) -> JevDecision | None:
@@ -1322,6 +1424,10 @@ def run_jev_diagnosis(
     code decides what is allowed:
 
     - finalize is withheld until ≥ _JEV_MIN_EVIDENCE_ITEMS successful tool calls;
+    - finalize is withheld until every required-evidence group has been tried
+      (a deterministic test and a live measurement), so the explainer reports
+      measured results instead of asking the operator to run them;
+    - if Jev tries to finalize early, the harness runs the required check itself;
     - an exact (tool, canonical args) repeat is excluded so Jev picks another tool;
     - each tool has a per-tool call budget; an exhausted tool is excluded, not fatal;
     - the whole loop is bounded by _JEV_MAX_ROUNDS.
@@ -1333,42 +1439,113 @@ def run_jev_diagnosis(
     seen: set[tuple[str, str]] = set()
     tool_counts: dict[str, int] = {}
     exhausted: set[str] = set()  # tools whose budget is spent or whose exact call repeated
+    relaxed: set[tuple[str, ...]] = set()  # required groups that cannot be collected
     topic_candidates: list[str] | None = None
     finalized = False
+
+    def record(action: str, args: dict[str, Any], result: str) -> None:
+        console.print(Text(f"  ⚡ {action} → {_trace_preview(result)}", style="dim"))
+        state.tool_calls.append(
+            ToolCall(tool=action, args=args, result=result, ok=_result_ok(result))
+        )
+        if action == "run_test":
+            _record_test_result(state, result)
+
+    def forced_args(action: str) -> dict[str, Any] | None:
+        """Deterministic arguments for a required check Jev did not choose."""
+        nonlocal topic_candidates
+        if action == "run_test":
+            test_id = "system_health" if "system_health" in TEST_CATALOG else "graph_health"
+            return {"test_id": test_id}
+        if action in ("sample_topic", "get_topic_snapshot"):
+            if topic_candidates is None:
+                topic_candidates = _jev_topic_candidates(runtime.node, state)
+            if not topic_candidates:
+                return None
+            topic = topic_candidates[0]
+            if action == "sample_topic":
+                return {"topic": topic, "duration_s": 3.0, "rate_hz": 5.0}
+            return {"topic": topic}
+        return None
+
+    def run_forced_required_check() -> bool:
+        """Run one unmet required check without asking Jev, so the diagnosis is
+        grounded in a deterministic test and a live measurement rather than in
+        hypotheses the operator is asked to verify. Returns True if one ran.
+        """
+        for group in unmet_evidence_requirements(state.tool_calls):
+            if group in relaxed:
+                continue
+            for tool in group:
+                if tool in exhausted or tool_counts.get(tool, 0) >= _JEV_MAX_CALLS_PER_TOOL:
+                    continue
+                args = forced_args(tool)
+                if args is None:
+                    relaxed.add(group)
+                    continue
+                key = (tool, json.dumps(args, sort_keys=True, default=str))
+                if key in seen:
+                    continue
+                seen.add(key)
+                tool_counts[tool] = tool_counts.get(tool, 0) + 1
+                console.print(Text(f"  ↳ running required check: {tool} {args}", style="dim"))
+                with console.status(f"[bold #00E5FF]⚡ {tool} {args}", spinner="bouncingBall"):
+                    result = runtime.execute(tool, args)
+                record(tool, args, result)
+                return True
+        return False
 
     for _round in range(_JEV_MAX_ROUNDS):
         state.step = _round + 1
         meaningful_calls = sum(1 for tc in state.tool_calls if tc.ok)
-        allow_finalize = meaningful_calls >= _JEV_MIN_EVIDENCE_ITEMS
+        unmet = [
+            group
+            for group in unmet_evidence_requirements(state.tool_calls)
+            if group not in relaxed
+        ]
+        allow_finalize = meaningful_calls >= _JEV_MIN_EVIDENCE_ITEMS and not unmet
         if not allow_finalize:
-            console.print(
-                Text(
-                    f"  🔒 finalize gated: need ≥{_JEV_MIN_EVIDENCE_ITEMS} successful "
-                    f"evidence call(s), have {meaningful_calls}",
-                    style="dim",
-                )
+            missing = ", ".join(group[0] for group in unmet) if unmet else (
+                f"≥{_JEV_MIN_EVIDENCE_ITEMS} successful calls"
             )
+            console.print(Text(f"  🔒 finalize gated: still need {missing}", style="dim"))
+
+        # On the last round, stop waiting for Jev and collect the required
+        # evidence deterministically so the explainer always has something solid.
+        if not allow_finalize and _round == _JEV_MAX_ROUNDS - 1:
+            if run_forced_required_check():
+                continue
+            relaxed.update(unmet)
 
         available = {a for a in JEV_ACTIONS if a != "finalize" and a not in exhausted}
         if not available:
             if allow_finalize:
                 console.print("[yellow]All evidence tools are exhausted; finalizing.[/yellow]")
-                finalized = True
             else:
-                console.print("[yellow]All evidence tools are exhausted, but finalize is still gated; stopping.[/yellow]")
+                console.print("[yellow]All evidence tools are exhausted; finalizing with the available evidence.[/yellow]")
+                relaxed.update(unmet)
+            finalized = True
             break
 
-        decision = _safe_jev_decision("next-action", router.next_action, state, allow_finalize, exhausted)
+        required_tools = [group[0] for group in unmet]
+        decision = _safe_jev_decision(
+            "next-action", router.next_action, state, allow_finalize, exhausted, required_tools
+        )
         if decision is None:
             break
         action = decision.action
         _print_jev_decision("next action", decision)
 
         if action == "finalize":
-            # Defensive: the gate already removed finalize when evidence is
-            # insufficient, so this should not happen; ignore if it does.
-            if not allow_finalize:
-                console.print("[yellow]Jev proposed finalize while gated; ignoring.[/yellow]")
+            # Deterministic gate: Jev may want to stop, but the harness still
+            # runs any required check it has not collected yet. Once every
+            # required group has been tried, finalize is accepted even if the
+            # soft evidence target was not reached (there is nothing left to
+            # force, so looping would only spin).
+            if unmet:
+                console.print("[yellow]Jev proposed finalize too early; running the required check instead.[/yellow]")
+                if not run_forced_required_check():
+                    relaxed.update(unmet)
                 continue
             finalized = True
             break
@@ -1434,25 +1611,63 @@ def run_jev_diagnosis(
 
         with console.status(f"[bold #00E5FF]⚡ {action} {args}", spinner="bouncingBall"):
             result = runtime.execute(action, args)
-        preview = result if len(result) <= 420 else result[:420] + " …"
-        console.print(Text(f"  ⚡ {action} → {preview}", style="dim"))
-        ok = _result_ok(result)
-        state.tool_calls.append(ToolCall(tool=action, args=args, result=result, ok=ok))
-        if action == "run_test":
-            _record_test_result(state, result)
+        record(action, args, result)
 
     if not state.tool_calls and not finalized:
         console.print("[yellow]No evidence was collected; nothing to explain.[/yellow]")
         return
 
+    tests_run = len(state.test_results)
     console.print(
         Panel(
-            Text("Jev: enough evidence — handing off to the LLM explainer", style="bold #B388FF"),
+            Text(
+                f"Evidence collection complete ({len(state.tool_calls)} tool call(s), "
+                f"{tests_run} deterministic test(s)) — writing diagnosis",
+                style="bold #B388FF",
+            ),
             border_style="#B388FF",
             title="System 1 → System 2",
         )
     )
-    explanation = explain_with_llm(llm_client, model, state, lang)
+    known_topics = _known_topic_names(runtime.node)
+    explanation = ""
+    for verify_round in range(_JEV_MAX_VERIFY_ROUNDS + 1):
+        explanation = explain_with_llm(llm_client, model, state, lang)
+        if verify_round >= _JEV_MAX_VERIFY_ROUNDS:
+            break
+        try:
+            proposals = plan_verification_with_llm(llm_client, model, state, explanation, lang)
+        except Exception as exc:  # noqa: BLE001 - planning is optional, never fatal
+            console.print(f"[yellow]Verification planning skipped: {type(exc).__name__}: {exc}[/yellow]")
+            break
+        checks = validated_verification_checks(proposals, state.tool_calls, TEST_CATALOG, known_topics)
+        if not checks:
+            break
+        console.print(
+            Panel(
+                Text(
+                    f"Verification round {verify_round + 1}: running {len(checks)} "
+                    "additional read-only check(s)",
+                    style="bold #B388FF",
+                ),
+                border_style="#B388FF",
+                title="Follow-up verification",
+            )
+        )
+        ran_any = False
+        for tool, args in checks:
+            key = (tool, json.dumps(args, sort_keys=True, default=str))
+            if key in seen or tool_counts.get(tool, 0) >= _JEV_MAX_CALLS_PER_TOOL:
+                continue
+            seen.add(key)
+            tool_counts[tool] = tool_counts.get(tool, 0) + 1
+            with console.status(f"[bold #00E5FF]⚡ {tool} {args}", spinner="bouncingBall"):
+                result = runtime.execute(tool, args)
+            record(tool, args, result)
+            ran_any = True
+        if not ran_any:
+            break
+
     console.print(
         Panel(
             Markdown(explanation or "(empty)"),

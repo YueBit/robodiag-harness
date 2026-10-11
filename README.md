@@ -331,7 +331,21 @@ User request
 QUERY / DIAGNOSIS / ACTION / CHAT
 ```
 
-For a diagnosis, Jev chooses which read-only evidence tool to call next. Once enough evidence has been collected, the LLM writes the final explanation.
+For a diagnosis, Jev chooses which read-only evidence tool to call next.
+
+Before the diagnosis is allowed to finalize, deterministic code requires that
+the evidence includes at least one deterministic health test and at least one
+live measurement. If Jev tries to stop before those have been collected, the
+harness runs the missing check itself instead of handing the operator a list of
+recommended checks.
+
+After the first explanation, a verification planner compares the draft against
+the evidence and proposes up to four read-only checks that would close the
+remaining gaps. The proposal is re-validated against the deterministic
+allowlist and executed by the harness, then the explainer runs again with the
+new evidence. This repeats for a bounded number of rounds, so a diagnosis
+reports the result of a check rather than recommending that the operator run
+it. Checks the harness genuinely cannot run stay under "Still unverified".
 
 The responsibilities stay separate:
 

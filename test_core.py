@@ -27,7 +27,16 @@ from unittest import mock
 
 import robodiag_core as core
 import robodiag_jev as jev
-from robodiag_jev import DiagnosticState, JevError, JevRouter, TestResult
+from robodiag_jev import (
+    DiagnosticState,
+    JevError,
+    JevRouter,
+    TestResult,
+    ToolCall,
+    parse_verification_plan,
+    unmet_evidence_requirements,
+    validated_verification_checks,
+)
 
 
 class FakeClient:
@@ -36,8 +45,10 @@ class FakeClient:
     def __init__(self, choice: str) -> None:
         self.choice = choice
         self.model = "fake"
+        self.last_questions = None
 
     def system_one(self, state, questions):
+        self.last_questions = questions
         key = next(iter(questions))
         answers = {
             key: {
@@ -302,6 +313,75 @@ class TestWhitelists(unittest.TestCase):
         with mock.patch.dict(core.TEST_CATALOG, {"motion_test": {"name": "motion", "description": "x", "writes": True}}):
             caps2 = core.build_action_capabilities()
         self.assertNotIn("run_test:motion_test", caps2)
+
+    def test_required_evidence_helper(self):
+        self.assertEqual(len(unmet_evidence_requirements([])), 2)
+        only_test = [ToolCall(tool="run_test", args={}, result="{}", ok=True)]
+        unmet = unmet_evidence_requirements(only_test)
+        self.assertEqual(unmet, [("sample_topic", "get_topic_snapshot")])
+        # An attempted-but-failed measurement still counts as attempted so the
+        # loop cannot deadlock on an unavailable topic.
+        failed_sample = [
+            ToolCall(tool="run_test", args={}, result="{}", ok=True),
+            ToolCall(tool="sample_topic", args={}, result='{"ok": false}', ok=False),
+        ]
+        self.assertEqual(unmet_evidence_requirements(failed_sample), [])
+        snapshot = [ToolCall(tool="get_topic_snapshot", args={}, result="{}", ok=True)]
+        self.assertEqual(unmet_evidence_requirements(snapshot), [("run_test",)])
+
+    def test_parse_verification_plan(self):
+        self.assertEqual(parse_verification_plan('{"checks": [{"tool": "inspect_graph"}]}'), [{"tool": "inspect_graph"}])
+        self.assertEqual(parse_verification_plan('```json\n{"checks": []}\n```'), [])
+        self.assertEqual(parse_verification_plan("not json"), [])
+        self.assertEqual(parse_verification_plan('{"checks": "nope"}'), [])
+
+    def test_validated_verification_checks_fails_closed(self):
+        catalog = {
+            "graph_health": {"writes": False},
+            "motion_test": {"writes": True},
+        }
+        proposals = [
+            {"tool": "emergency_stop"},
+            {"tool": "finalize"},
+            {"tool": "does_not_exist"},
+            {"tool": "run_test", "args": {"test_id": "motion_test"}},
+            {"tool": "run_test", "args": {"test_id": "unknown"}},
+            {"tool": "sample_topic", "args": {"topic": "/not/in/graph"}},
+            {"tool": "sample_topic", "args": {"topic": "relative"}},
+            {"tool": "sample_topic", "args": {"topic": "/imu/data"}},
+            {"tool": "run_test", "args": {"test_id": "graph_health"}},
+        ]
+        checks = validated_verification_checks(
+            proposals, [], catalog, {"/imu/data"}, max_checks=10
+        )
+        self.assertEqual(
+            checks,
+            [("sample_topic", {"topic": "/imu/data", "duration_s": 3.0, "rate_hz": 5.0}),
+             ("run_test", {"test_id": "graph_health"})],
+        )
+
+    def test_validated_verification_checks_dedups_and_caps(self):
+        catalog = {"graph_health": {"writes": False}}
+        already = [ToolCall(tool="inspect_graph", args={}, result="{}", ok=True)]
+        proposals = [
+            {"tool": "inspect_graph"},
+            {"tool": "get_diagnostics"},
+            {"tool": "inspect_ros2_control"},
+            {"tool": "query_history"},
+        ]
+        checks = validated_verification_checks(proposals, already, catalog, set(), max_checks=2)
+        self.assertEqual(len(checks), 2)
+        self.assertNotIn("inspect_graph", [tool for tool, _ in checks])
+
+    def test_next_action_reports_required_categories(self):
+        client = FakeClient("run_test")
+        router = JevRouter(client)
+        router.next_action(
+            DiagnosticState(symptom="x"), allow_finalize=False, required=["run_test"]
+        )
+        instructions = client.last_questions["next_action"]["instructions"]
+        self.assertIn("run_test", instructions)
+        self.assertNotIn("finalize", client.last_questions["next_action"]["criteria"])
 
     def test_next_action_exclude_removes_actions(self):
         router = JevRouter(FakeClient("get_diagnostics"))
