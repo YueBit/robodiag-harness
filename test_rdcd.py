@@ -54,14 +54,17 @@ def make_rdcd() -> rdcd.Rdcd:
 
 
 class FakeNode:
-    """A healthy robot with diagnostics and joint_states but no battery."""
+    """A healthy Mini Pupper 2: diagnostics + joint_states + imu + odom + cmd_vel."""
 
     def inspect_graph(self):
         return {
-            "summary": {"nodes": 5, "topics": 10, "services": 4},
+            "summary": {"nodes": 5, "topics": 8, "services": 4},
             "topics": [
                 {"name": "/joint_states", "types": ["sensor_msgs/msg/JointState"]},
                 {"name": "/diagnostics", "types": ["diagnostic_msgs/msg/DiagnosticArray"]},
+                {"name": "/imu/data", "types": ["sensor_msgs/msg/Imu"]},
+                {"name": "/odom", "types": ["nav_msgs/msg/Odometry"]},
+                {"name": "/cmd_vel", "types": ["geometry_msgs/msg/Twist"]},
             ],
         }
 
@@ -74,11 +77,52 @@ class FakeNode:
     def joint_state_cached(self):
         return {"available": True, "age_s": 0.1, "message": {}}
 
-    def sample_topic(self, topic, duration_s=2.5, rate_hz=10.0):
+    def sample_topic(self, topic, duration_s=2.0, rate_hz=20.0):
+        if topic == "/imu/data":
+            return {
+                "ok": True,
+                "samples": 40,
+                "effective_rate_hz": 100.0,
+                "statistics": {},
+                "last": {
+                    "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                    "angular_velocity": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "linear_acceleration": {"x": 0.0, "y": 0.0, "z": 9.81},
+                    "orientation_covariance": [0.01] * 9,
+                    "angular_velocity_covariance": [0.01] * 9,
+                    "linear_acceleration_covariance": [0.01] * 9,
+                },
+            }
+        if topic == "/odom":
+            return {
+                "ok": True,
+                "samples": 40,
+                "effective_rate_hz": 50.0,
+                "statistics": {},
+                "last": {
+                    "pose": {
+                        "pose": {
+                            "position": {"x": 0.0, "y": 0.0, "z": 0.0},
+                            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                        },
+                        "covariance": [0.1] * 36,
+                    },
+                    "twist": {
+                        "twist": {
+                            "linear": {"x": 0.0, "y": 0.0, "z": 0.0},
+                            "angular": {"x": 0.0, "y": 0.0, "z": 0.0},
+                        },
+                        "covariance": [0.1] * 36,
+                    },
+                },
+            }
+        if topic == "/cmd_vel":
+            return {"ok": False, "error": "no samples received during 1.5s"}
         return {
             "ok": True,
             "samples": 10,
             "effective_rate_hz": 5.0,
+            "statistics": {},
             "last": {"_joints": {"lf1": {"position": 0.1}}},
         }
 
@@ -193,6 +237,101 @@ class TestTestRunnerWithRdcd(unittest.TestCase):
             self.assertEqual(runner.run("battery_health")["result"], "NOT_SUPPORTED")
             runner.rdcd = None
             self.assertEqual(runner.run("battery_health")["result"], "SKIP")
+
+
+class TestTier1Tests(unittest.TestCase):
+    def _run(self, test_id, rdcd=None, node=None):
+        node = node or FakeNode()
+        with tempfile.TemporaryDirectory() as d:
+            runner = core.TestRunner(node, core.HistoryStore(Path(d) / "h.db"), rdcd=rdcd)
+            return runner.run(test_id)
+
+    def test_imu_health_passes_when_declared_and_healthy(self):
+        res = self._run("imu_health", rdcd=make_rdcd())
+        self.assertEqual(res["result"], "PASS")
+
+    def test_imu_health_fails_when_declared_but_stream_unavailable(self):
+        node = FakeNode()
+        node.sample_topic = lambda *a, **k: {"ok": False, "error": "no samples received during 2.0s"}
+        res = self._run("imu_health", rdcd=make_rdcd(), node=node)
+        self.assertEqual(res["result"], "FAIL")
+
+    def test_imu_health_skips_in_generic_mode_without_imu(self):
+        node = FakeNode()
+        node.sample_topic = lambda *a, **k: {"ok": False, "error": "topic not found: /imu/data"}
+        res = self._run("imu_health", rdcd=None, node=node)
+        self.assertEqual(res["result"], "SKIP")
+
+    def test_imu_health_fails_on_degenerate_quaternion(self):
+        node = FakeNode()
+        node.sample_topic = lambda *a, **k: {
+            "ok": True,
+            "samples": 40,
+            "effective_rate_hz": 100.0,
+            "last": {
+                "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 0.0},
+                "angular_velocity": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "linear_acceleration": {"x": 0.0, "y": 0.0, "z": 9.81},
+                "orientation_covariance": [0.01] * 9,
+            },
+        }
+        res = self._run("imu_health", rdcd=make_rdcd(), node=node)
+        self.assertEqual(res["result"], "FAIL")
+
+    def test_odometry_health_passes_when_declared_and_healthy(self):
+        res = self._run("odometry_health", rdcd=make_rdcd())
+        self.assertEqual(res["result"], "PASS")
+
+    def test_odometry_health_fails_when_declared_but_stream_unavailable(self):
+        node = FakeNode()
+        node.sample_topic = lambda *a, **k: {"ok": False, "error": "no samples received during 2.0s"}
+        res = self._run("odometry_health", rdcd=make_rdcd(), node=node)
+        self.assertEqual(res["result"], "FAIL")
+
+    def test_velocity_command_at_rest_passes(self):
+        res = self._run("velocity_command_health", rdcd=make_rdcd())
+        self.assertEqual(res["result"], "PASS")
+
+    def test_velocity_command_out_of_bounds_warns(self):
+        node = FakeNode()
+        node.sample_topic = lambda *a, **k: {
+            "ok": True,
+            "samples": 20,
+            "effective_rate_hz": 20.0,
+            "statistics": {
+                "linear.x": {"min": -10.0, "max": 10.0},
+                "angular.z": {"min": -1.0, "max": 1.0},
+            },
+            "last": {
+                "linear": {"x": 10.0, "y": 0.0, "z": 0.0},
+                "angular": {"x": 0.0, "y": 0.0, "z": 1.0},
+            },
+        }
+        res = self._run("velocity_command_health", rdcd=make_rdcd(), node=node)
+        self.assertEqual(res["result"], "WARN")
+
+    def test_declared_capability_check_skips_without_rdcd(self):
+        res = self._run("declared_capability_check", rdcd=None)
+        self.assertEqual(res["result"], "SKIP")
+
+    def test_declared_capability_check_passes_when_all_present(self):
+        res = self._run("declared_capability_check", rdcd=make_rdcd())
+        self.assertEqual(res["result"], "PASS")
+
+    def test_declared_capability_check_fails_when_missing(self):
+        node = FakeNode()
+        node.inspect_graph = lambda: {
+            "summary": {"nodes": 5, "topics": 4, "services": 4},
+            "topics": [
+                {"name": "/joint_states", "types": ["sensor_msgs/msg/JointState"]},
+                {"name": "/diagnostics", "types": ["diagnostic_msgs/msg/DiagnosticArray"]},
+                {"name": "/odom", "types": ["nav_msgs/msg/Odometry"]},
+                {"name": "/cmd_vel", "types": ["geometry_msgs/msg/Twist"]},
+            ],
+        }
+        res = self._run("declared_capability_check", rdcd=make_rdcd(), node=node)
+        self.assertEqual(res["result"], "FAIL")
+        self.assertIn("imu=MISSING", res["summary"])
 
 
 class TestSafetyGateWithRdcd(unittest.TestCase):

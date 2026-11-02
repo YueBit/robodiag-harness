@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from robodiag_jev import Evidence, QueryCapability, TestResult
-from robodiag_rdcd import Rdcd
+from robodiag_rdcd import MISSING, TYPE_MISMATCH, Rdcd, capability_status
 
 # DiagnosticStatus.level is a `byte` field; on ROS 2 Humble the class constants
 # are `bytes` (b'\x00'..b'\x03'), so use plain ints internally.
@@ -35,6 +35,38 @@ DIAG_OK = 0
 DIAG_WARN = 1
 DIAG_ERROR = 2
 DIAG_STALE = 3
+
+# Tier-1 sensor-test thresholds. Module constants (rather than constructor
+# parameters) to match the inline-threshold style already used by
+# joint_states_health; lift into TestRunner.__init__ if per-robot tuning is
+# ever needed.
+IMU_QUATERNION_TOLERANCE = 0.15
+IMU_ACCEL_G_MIN = 5.0   # m/s² — gravity plausibility floor
+IMU_ACCEL_G_MAX = 15.0  # m/s² — gravity plausibility ceiling
+IMU_MIN_RATE_HZ = 5.0
+ODOM_MIN_RATE_HZ = 5.0
+MAX_CMD_VEL_LINEAR = 2.0   # m/s
+MAX_CMD_VEL_ANGULAR = 6.0  # rad/s
+
+
+def _finite(value: Any) -> float | None:
+    """Return ``value`` as a finite float, or None when missing/non-numeric/non-finite."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _covariance_meaningful(cov: Any) -> bool:
+    """True when a covariance array contains at least one non-zero finite entry."""
+    if not isinstance(cov, list) or not cov:
+        return False
+    for entry in cov:
+        v = _finite(entry)
+        if v is not None and v != 0.0:
+            return True
+    return False
 
 
 def now_iso() -> str:
@@ -420,9 +452,32 @@ TEST_CATALOG = {
         "writes": False,
         "requires": "ros2_control",
     },
+    "imu_health": {
+        "name": "IMU health",
+        "description": "Sample the IMU stream and check finite values, quaternion normalization, gravity plausibility and covariance population.",
+        "writes": False,
+        "requires": "imu",
+    },
+    "odometry_health": {
+        "name": "Odometry health",
+        "description": "Sample the odometry stream and check finite pose/twist values, quaternion normalization and covariance population.",
+        "writes": False,
+        "requires": "odometry",
+    },
+    "velocity_command_health": {
+        "name": "Velocity command health",
+        "description": "Observe the velocity-command topic and flag non-finite or out-of-bounds motion commands.",
+        "writes": False,
+        "requires": "velocity_command",
+    },
+    "declared_capability_check": {
+        "name": "Declared capability check",
+        "description": "Verify every RDCD-declared capability has its topic present with the declared message type.",
+        "writes": False,
+    },
     "system_health": {
         "name": "Composite system health",
-        "description": "Run graph, diagnostics, battery, joint-state and ros2_control checks and aggregate the result.",
+        "description": "Run graph, diagnostics, battery, joint-state, ros2_control, IMU and odometry checks and aggregate the result.",
         "writes": False,
     },
 }
@@ -460,6 +515,19 @@ class TestRunner:
             summary = f"{req} telemetry is not supported by the {self.rdcd.name} RDCD."
             return ("NOT_SUPPORTED", summary, [])
         return None
+
+    def _capability_topic(self, capability: str, conventional: str) -> str | None:
+        """Resolve the topic to probe for a capability.
+
+        With an RDCD the declared topic wins (``run`` only reaches a test method
+        after establishing the capability is declared, otherwise it returns
+        NOT_SUPPORTED). Without an RDCD (generic mode) fall back to the
+        conventional ROS topic name.
+        """
+        if self.rdcd is not None:
+            spec = self.rdcd.get(capability)
+            return spec.topic if spec is not None else None
+        return conventional
 
     def run(self, test_id: str) -> dict[str, Any]:
         if test_id not in TEST_CATALOG:
@@ -611,6 +679,210 @@ class TestRunner:
             return "WARN", "Controllers are loaded but none are active.", evidence
         return "PASS", f"ros2_control reachable; {len(active_controllers)} active controller(s).", evidence
 
+    def _test_imu_health(self) -> tuple[str, str, list[dict[str, Any]]]:
+        topic = self._capability_topic("imu", "/imu/data")
+        declared = self.rdcd is not None
+        s = self.node.sample_topic(topic, duration_s=2.0, rate_hz=20.0)
+        evidence = [asdict(Evidence(topic, "sample", s, now_iso()))]
+        if not s.get("ok"):
+            if declared:
+                return "FAIL", f"Declared IMU stream unavailable: {s.get('error')}", evidence
+            return "SKIP", f"No IMU stream discovered ({s.get('error')}); skipped.", evidence
+
+        last = s.get("last", {}) if isinstance(s.get("last"), dict) else {}
+        orient = last.get("orientation") or {}
+        angular = last.get("angular_velocity") or {}
+        accel = last.get("linear_acceleration") or {}
+        if not orient and not angular and not accel:
+            if declared:
+                return "FAIL", "IMU topic returned no IMU fields (message-type mismatch?).", evidence
+            return "SKIP", "Sampled topic does not carry IMU fields; skipped.", evidence
+
+        fields = {
+            "orientation.x": orient.get("x"),
+            "orientation.y": orient.get("y"),
+            "orientation.z": orient.get("z"),
+            "orientation.w": orient.get("w"),
+            "angular_velocity.x": angular.get("x"),
+            "angular_velocity.y": angular.get("y"),
+            "angular_velocity.z": angular.get("z"),
+            "linear_acceleration.x": accel.get("x"),
+            "linear_acceleration.y": accel.get("y"),
+            "linear_acceleration.z": accel.get("z"),
+        }
+        nonfinite = sorted(k for k, v in fields.items() if _finite(v) is None)
+        if nonfinite:
+            return "FAIL", "IMU has non-finite fields: " + ", ".join(nonfinite) + ".", evidence
+
+        qx, qy, qz, qw = (_finite(orient.get(k)) for k in ("x", "y", "z", "w"))
+        qnorm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+        quat_dev = abs(qnorm - 1.0)
+
+        ax, ay, az = (_finite(accel.get(k)) for k in ("x", "y", "z"))
+        accel_mag = math.sqrt(ax * ax + ay * ay + az * az)
+
+        cov_ok = _covariance_meaningful(last.get("orientation_covariance"))
+        rate = float(s.get("effective_rate_hz", 0.0) or 0.0)
+
+        if quat_dev > 3.0 * IMU_QUATERNION_TOLERANCE:
+            return "FAIL", f"IMU quaternion is degenerate (norm={qnorm:.3f}).", evidence
+
+        problems = []
+        if quat_dev > IMU_QUATERNION_TOLERANCE:
+            problems.append(f"quaternion norm deviates from 1 (norm={qnorm:.3f})")
+        if not (IMU_ACCEL_G_MIN <= accel_mag <= IMU_ACCEL_G_MAX):
+            problems.append(f"linear acceleration magnitude {accel_mag:.1f} m/s² outside [{IMU_ACCEL_G_MIN}, {IMU_ACCEL_G_MAX}]")
+        if not cov_ok:
+            problems.append("orientation covariance is unpopulated (all zero/absent)")
+        if rate < IMU_MIN_RATE_HZ:
+            problems.append(f"effective publish rate {rate:.1f} Hz below {IMU_MIN_RATE_HZ} Hz")
+
+        if problems:
+            return "WARN", "; ".join(problems) + ".", evidence
+        return "PASS", f"IMU stream healthy ({rate:.0f} Hz, |accel|={accel_mag:.1f} m/s²).", evidence
+
+    def _test_odometry_health(self) -> tuple[str, str, list[dict[str, Any]]]:
+        topic = self._capability_topic("odometry", "/odom")
+        declared = self.rdcd is not None
+        s = self.node.sample_topic(topic, duration_s=2.0, rate_hz=20.0)
+        evidence = [asdict(Evidence(topic, "sample", s, now_iso()))]
+        if not s.get("ok"):
+            if declared:
+                return "FAIL", f"Declared odometry stream unavailable: {s.get('error')}", evidence
+            return "SKIP", f"No odometry stream discovered ({s.get('error')}); skipped.", evidence
+
+        last = s.get("last", {}) if isinstance(s.get("last"), dict) else {}
+        pose = last.get("pose") or {}
+        pose_pose = pose.get("pose") or {}
+        position = pose_pose.get("position") or {}
+        orient = pose_pose.get("orientation") or {}
+        twist = (last.get("twist") or {}).get("twist") or {}
+        linear = twist.get("linear") or {}
+        angular = twist.get("angular") or {}
+        if not position and not orient and not linear and not angular:
+            if declared:
+                return "FAIL", "Odometry topic returned no odometry fields (message-type mismatch?).", evidence
+            return "SKIP", "Sampled topic does not carry odometry fields; skipped.", evidence
+
+        fields = {
+            "position.x": position.get("x"),
+            "position.y": position.get("y"),
+            "position.z": position.get("z"),
+            "orientation.x": orient.get("x"),
+            "orientation.y": orient.get("y"),
+            "orientation.z": orient.get("z"),
+            "orientation.w": orient.get("w"),
+            "twist.linear.x": linear.get("x"),
+            "twist.linear.y": linear.get("y"),
+            "twist.linear.z": linear.get("z"),
+            "twist.angular.x": angular.get("x"),
+            "twist.angular.y": angular.get("y"),
+            "twist.angular.z": angular.get("z"),
+        }
+        nonfinite = sorted(k for k, v in fields.items() if _finite(v) is None)
+        if nonfinite:
+            return "FAIL", "Odometry has non-finite fields: " + ", ".join(nonfinite) + ".", evidence
+
+        qx, qy, qz, qw = (_finite(orient.get(k)) for k in ("x", "y", "z", "w"))
+        qnorm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+        quat_dev = abs(qnorm - 1.0)
+        pose_cov_ok = _covariance_meaningful(pose.get("covariance"))
+        rate = float(s.get("effective_rate_hz", 0.0) or 0.0)
+
+        if quat_dev > 3.0 * IMU_QUATERNION_TOLERANCE:
+            return "FAIL", f"Odometry orientation quaternion is degenerate (norm={qnorm:.3f}).", evidence
+
+        problems = []
+        if quat_dev > IMU_QUATERNION_TOLERANCE:
+            problems.append(f"orientation quaternion norm deviates from 1 (norm={qnorm:.3f})")
+        if not pose_cov_ok:
+            problems.append("pose covariance is unpopulated (all zero/absent)")
+        if rate < ODOM_MIN_RATE_HZ:
+            problems.append(f"effective publish rate {rate:.1f} Hz below {ODOM_MIN_RATE_HZ} Hz")
+
+        if problems:
+            return "WARN", "; ".join(problems) + ".", evidence
+        return "PASS", f"Odometry stream healthy ({rate:.0f} Hz).", evidence
+
+    def _test_velocity_command_health(self) -> tuple[str, str, list[dict[str, Any]]]:
+        topic = self._capability_topic("velocity_command", "/cmd_vel")
+        declared = self.rdcd is not None
+        s = self.node.sample_topic(topic, duration_s=1.5, rate_hz=20.0)
+        evidence = [asdict(Evidence(topic, "sample", s, now_iso()))]
+        if not s.get("ok"):
+            err = s.get("error", "")
+            if "no samples" in err or "no message" in err:
+                return "PASS", "No velocity commands observed; robot is at rest.", evidence
+            if declared:
+                return "FAIL", f"Declared velocity-command stream unavailable: {err}", evidence
+            return "SKIP", f"No usable velocity-command topic ({err}); skipped.", evidence
+
+        last = s.get("last", {}) if isinstance(s.get("last"), dict) else {}
+        linear = last.get("linear") or {}
+        angular = last.get("angular") or {}
+        if not linear and not angular:
+            if declared:
+                return "FAIL", "Velocity-command topic returned no Twist fields (message-type mismatch?).", evidence
+            return "SKIP", "Sampled topic does not carry Twist fields; skipped.", evidence
+
+        nonfinite = []
+        for k in ("x", "y", "z"):
+            if _finite(linear.get(k)) is None:
+                nonfinite.append(f"linear.{k}")
+            if _finite(angular.get(k)) is None:
+                nonfinite.append(f"angular.{k}")
+        if nonfinite:
+            return "FAIL", "Velocity command has non-finite fields: " + ", ".join(nonfinite) + ".", evidence
+
+        stats = s.get("statistics") or {}
+
+        def _peak(path: str) -> float:
+            v = stats.get(path)
+            if not isinstance(v, dict):
+                return 0.0
+            lo = _finite(v.get("min"))
+            hi = _finite(v.get("max"))
+            return max(abs(lo or 0.0), abs(hi or 0.0))
+
+        linear_peak = max(_peak(f"linear.{k}") for k in ("x", "y", "z"))
+        angular_peak = max(_peak(f"angular.{k}") for k in ("x", "y", "z"))
+
+        problems = []
+        if linear_peak > MAX_CMD_VEL_LINEAR:
+            problems.append(f"linear velocity command peak {linear_peak:.2f} m/s exceeds {MAX_CMD_VEL_LINEAR:.1f} m/s")
+        if angular_peak > MAX_CMD_VEL_ANGULAR:
+            problems.append(f"angular velocity command peak {angular_peak:.2f} rad/s exceeds {MAX_CMD_VEL_ANGULAR:.1f} rad/s")
+
+        if problems:
+            return "WARN", "; ".join(problems) + ".", evidence
+        return "PASS", f"Velocity commands within bounds (peak {linear_peak:.2f} m/s, {angular_peak:.2f} rad/s).", evidence
+
+    def _test_declared_capability_check(self) -> tuple[str, str, list[dict[str, Any]]]:
+        if self.rdcd is None:
+            return "SKIP", "No RDCD loaded; declared-capability validation is not applicable.", []
+
+        graph = self.node.inspect_graph() if self.node is not None else {}
+        topics = graph.get("topics", []) if isinstance(graph, dict) else []
+        topic_types = {t.get("name"): t.get("types", []) for t in topics if isinstance(t, dict)}
+
+        rows = []
+        for cap_name in self.rdcd.declared():
+            spec = self.rdcd.get(cap_name)
+            status = capability_status(self.rdcd, cap_name, topic_types)
+            rows.append({
+                "capability": cap_name,
+                "topic": spec.topic,
+                "expected_type": spec.message_type,
+                "status": status,
+            })
+        evidence = [asdict(Evidence("rdcd", self.rdcd.robot_id, {"capabilities": rows}, now_iso()))]
+
+        bad = [r for r in rows if r["status"] in (MISSING, TYPE_MISMATCH)]
+        if bad:
+            detail = "; ".join(f"{r['capability']}={r['status']}" for r in bad)
+            return "FAIL", f"{len(bad)} declared capability(s) missing/type-mismatched: {detail}", evidence
+        return "PASS", f"All {len(rows)} declared capabilities are present with the declared message type.", evidence
+
     def _test_system_health(self) -> tuple[str, str, list[dict[str, Any]]]:
         sub_ids = [
             "graph_health",
@@ -618,6 +890,8 @@ class TestRunner:
             "battery_health",
             "joint_states_health",
             "ros2_control_health",
+            "imu_health",
+            "odometry_health",
         ]
         sub_results = []
         for sid in sub_ids:

@@ -240,6 +240,10 @@ Built-in tests:
 | `battery_health` | Check BatteryState percentage, voltage, freshness, validity |
 | `joint_states_health` | Sample joint states; check rate, values, stream health |
 | `ros2_control_health` | Inspect controllers, hardware, interfaces |
+| `imu_health` | Sample the IMU; check finite values, quaternion norm, gravity plausibility, covariance |
+| `odometry_health` | Sample odometry; check finite pose/twist, quaternion norm, covariance |
+| `velocity_command_health` | Observe the velocity-command topic; flag non-finite or out-of-bounds commands |
+| `declared_capability_check` | Verify every RDCD-declared capability is present with the declared message type |
 | `system_health` | Run the applicable tests and combine the result |
 
 Normal results:
@@ -258,6 +262,8 @@ N/A
 ```
 
 Internally that's `NOT_SUPPORTED`. It never drags down overall health. Mini Pupper 2 doesn't declare battery or `ros2_control`, so those checks simply don't count against it.
+
+`velocity_command_health` is special: it passes when the velocity-command topic is silent (robot at rest), and warns when commands exceed the platform limits (`MAX_CMD_VEL_LINEAR` / `MAX_CMD_VEL_ANGULAR` in `robodiag_core.py`). `declared_capability_check` is a meta-test that cross-checks the active RDCD against the live graph, so a declared-but-missing topic (e.g. an unplugged IMU) is reported as a real finding.
 
 But a declared capability that *should* exist and is missing at runtime is different — that's a real finding.
 
