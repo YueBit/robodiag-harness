@@ -49,6 +49,8 @@ JEV_ACTIONS: dict[str, str] = {
     "list_tests": "List the deterministic health tests when unsure which test to run.",
     "run_test": "Run an existing deterministic health test when a structured check would confirm a hypothesis.",
     "query_history": "Review previous health-test results when historical comparison may help.",
+    "query_baseline": "Read the rolling baseline statistics when comparing current values against normal drift.",
+    "get_timeline": "Read recent /rosout log entries when correlating events around a fault.",
     "check_motion_safety": "Check the deterministic motion Safety Gate (read-only) before any motion-related decision.",
     "finalize": "Enough evidence exists to explain the likely problem and recommend next steps.",
 }

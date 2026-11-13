@@ -1,4 +1,4 @@
-schema_version: 0.1
+schema_version: 0.2
 
 robot:
   id: mini_pupper_2
@@ -9,19 +9,26 @@ capabilities:
   diagnostics:
     topic: /diagnostics
     message_type: diagnostic_msgs/msg/DiagnosticArray
+    required_for_motion: true
+    description: Standard robot diagnostics; must be fresh and ERROR-free before motion.
 
   joint_states:
     topic: /joint_states
     message_type: sensor_msgs/msg/JointState
+    required_for_motion: true
+    description: Joint stream; must be fresh before motion.
 
   imu:
     topic: /imu/data
     message_type: sensor_msgs/msg/Imu
+    description: Inertial measurement; used for attitude checks and odometry cross-checks.
 
   odometry:
     topic: /odom
     message_type: nav_msgs/msg/Odometry
+    description: Odometry; used for commanded-vs-observed motion cross-checks.
 
   velocity_command:
     topic: /cmd_vel
     message_type: geometry_msgs/msg/Twist
+    description: Velocity command; used for the software stop and command monitoring.

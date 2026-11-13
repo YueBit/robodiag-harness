@@ -48,6 +48,21 @@ ODOM_MIN_RATE_HZ = 5.0
 MAX_CMD_VEL_LINEAR = 2.0   # m/s
 MAX_CMD_VEL_ANGULAR = 6.0  # rad/s
 
+# Tier-2 cross-sensor consistency thresholds. Degrees are used for attitude so
+# the numbers read naturally in test summaries; angular rates stay in rad/s.
+ODOM_IMU_ROLL_PITCH_WARN_DEG = 5.0
+ODOM_IMU_ROLL_PITCH_FAIL_DEG = 15.0
+ODOM_IMU_ANGULAR_WARN_RAD_S = 0.05
+ODOM_IMU_ANGULAR_FAIL_RAD_S = 0.20
+CMD_VS_MOTION_CMD_THRESHOLD = 0.02     # m/s — below this a command counts as "at rest"
+CMD_VS_MOTION_MOTION_THRESHOLD = 0.01  # m/s — below this odometry counts as "not moving"
+CMD_VS_MOTION_RESPONSE_RATIO = 0.30    # observed/commanded below this → slip/stall warning
+
+# Baseline drift thresholds, in standard deviations from the rolling mean.
+BASELINE_MIN_SAMPLES = 5
+BASELINE_WARN_SIGMA = 3.0
+BASELINE_FAIL_SIGMA = 5.0
+
 
 def _finite(value: Any) -> float | None:
     """Return ``value`` as a finite float, or None when missing/non-numeric/non-finite."""
@@ -67,6 +82,29 @@ def _covariance_meaningful(cov: Any) -> bool:
         if v is not None and v != 0.0:
             return True
     return False
+
+
+def _quat_to_rpy(qx: float, qy: float, qz: float, qw: float) -> tuple[float, float, float]:
+    """Convert a quaternion (x, y, z, w) to (roll, pitch, yaw) in radians."""
+    sinr_cosp = 2.0 * (qw * qx + qy * qz)
+    cosr_cosp = 1.0 - 2.0 * (qx * qx + qy * qy)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+
+    sinp = 2.0 * (qw * qy - qz * qx)
+    if abs(sinp) >= 1.0:
+        pitch = math.copysign(math.pi / 2.0, sinp)
+    else:
+        pitch = math.asin(sinp)
+
+    siny_cosp = 2.0 * (qw * qz + qx * qy)
+    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
+    return roll, pitch, yaw
+
+
+def _angle_diff_deg(a_deg: float, b_deg: float) -> float:
+    """Signed shortest angular difference in degrees, wrapped to [-180, 180]."""
+    return (a_deg - b_deg + 180.0) % 360.0 - 180.0
 
 
 def now_iso() -> str:
@@ -323,6 +361,160 @@ class HistoryStore:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Rolling baseline (drift detection)
+# ──────────────────────────────────────────────────────────────────────────────
+class BaselineStore:
+    """Per-metric rolling baseline for detecting drift from "normal".
+
+    Uses Welford's online algorithm so only count/mean/M2/min/max are stored per
+    metric — no raw value history grows without bound. A later observation can be
+    compared against the baseline as a z-score (standard deviations from the
+    rolling mean), which is what ``baseline_health`` reports.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path.expanduser()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        con = self._connect()
+        try:
+            with con:
+                con.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS baseline_metrics (
+                        metric TEXT PRIMARY KEY,
+                        n INTEGER NOT NULL,
+                        mean REAL NOT NULL,
+                        m2 REAL NOT NULL,
+                        min REAL NOT NULL,
+                        max REAL NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+        finally:
+            con.close()
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(str(self.path), timeout=3.0)
+
+    @staticmethod
+    def _row_to_dict(row: tuple[Any, ...]) -> dict[str, Any]:
+        metric, n, mean, m2, lo, hi, updated_at = row
+        std = math.sqrt(m2 / (n - 1)) if n >= 2 else None
+        return {
+            "metric": metric,
+            "n": n,
+            "mean": round(mean, 6),
+            "std": round(std, 6) if std is not None else None,
+            "min": round(lo, 6),
+            "max": round(hi, 6),
+            "updated_at": updated_at,
+        }
+
+    def observe(self, metric: str, value: float) -> dict[str, Any]:
+        """Merge one value into the baseline and return the updated row."""
+        v = _finite(value)
+        if v is None:
+            raise ValueError(f"cannot baseline non-finite value {value!r}")
+        with self._lock:
+            con = self._connect()
+            try:
+                row = con.execute(
+                    "SELECT metric, n, mean, m2, min, max, updated_at "
+                    "FROM baseline_metrics WHERE metric = ?",
+                    (metric,),
+                ).fetchone()
+                if row is None:
+                    n, mean, m2, lo, hi = 1, v, 0.0, v, v
+                else:
+                    _, n, mean, m2, lo, hi, _ = row
+                    n += 1
+                    delta = v - mean
+                    mean = mean + delta / n
+                    delta2 = v - mean
+                    m2 = m2 + delta * delta2
+                    lo = min(lo, v)
+                    hi = max(hi, v)
+                updated_at = now_iso()
+                with con:
+                    con.execute(
+                        "INSERT INTO baseline_metrics "
+                        "(metric, n, mean, m2, min, max, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(metric) DO UPDATE SET "
+                        "n=excluded.n, mean=excluded.mean, m2=excluded.m2, "
+                        "min=excluded.min, max=excluded.max, updated_at=excluded.updated_at",
+                        (metric, n, mean, m2, lo, hi, updated_at),
+                    )
+            finally:
+                con.close()
+        return self._row_to_dict((metric, n, mean, m2, lo, hi, updated_at))
+
+    def compare(self, metric: str, value: float) -> dict[str, Any]:
+        """Compare a value against the baseline without updating it.
+
+        Returns ``{metric, value, n, mean, std, sigma}`` where ``sigma`` is the
+        absolute z-score (standard deviations from the mean) and is None until
+        at least two observations exist.
+        """
+        v = _finite(value)
+        if v is None:
+            raise ValueError(f"cannot compare non-finite value {value!r}")
+        with self._lock:
+            con = self._connect()
+            try:
+                row = con.execute(
+                    "SELECT n, mean, m2 FROM baseline_metrics WHERE metric = ?",
+                    (metric,),
+                ).fetchone()
+            finally:
+                con.close()
+        if row is None:
+            return {"metric": metric, "value": round(v, 6), "n": 0, "mean": None, "std": None, "sigma": None}
+        n, mean, m2 = row
+        if n < 2:
+            return {"metric": metric, "value": round(v, 6), "n": n, "mean": round(mean, 6), "std": None, "sigma": None}
+        std = math.sqrt(m2 / (n - 1))
+        if std == 0.0:
+            # Zero historical variance: any deviation is a huge (effectively
+            # infinite) drift, but keep it finite so it stays JSON-safe.
+            sigma = 0.0 if abs(v - mean) < 1e-12 else 1e9
+        else:
+            sigma = abs(v - mean) / std
+        return {
+            "metric": metric,
+            "value": round(v, 6),
+            "n": n,
+            "mean": round(mean, 6),
+            "std": round(std, 6),
+            "sigma": round(sigma, 6),
+        }
+
+    def stats(self) -> list[dict[str, Any]]:
+        """Return every baselined metric, ordered by most recent update."""
+        with self._lock:
+            con = self._connect()
+            try:
+                rows = con.execute(
+                    "SELECT metric, n, mean, m2, min, max, updated_at "
+                    "FROM baseline_metrics ORDER BY updated_at DESC"
+                ).fetchall()
+            finally:
+                con.close()
+        return [self._row_to_dict(r) for r in rows]
+
+    def clear(self) -> None:
+        with self._lock:
+            con = self._connect()
+            try:
+                with con:
+                    con.execute("DELETE FROM baseline_metrics")
+            finally:
+                con.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Safety Gate
 # ──────────────────────────────────────────────────────────────────────────────
 class SafetyGate:
@@ -348,11 +540,18 @@ class SafetyGate:
         """Whether a capability belongs to the applicable safety evidence set.
 
         Generic mode (no RDCD) keeps the existing assumption that every
-        evidence class is required. With an RDCD, only declared capabilities
-        are required — so e.g. a robot without battery telemetry is not blocked
-        merely because no battery data exists.
+        evidence class is required. With an RDCD, only the capabilities the
+        RDCD declares ``required_for_motion`` are required — falling back to
+        "all declared capabilities" when the RDCD does not mark any. This lets
+        e.g. a robot without battery telemetry avoid being blocked merely
+        because no battery data exists.
         """
-        return self.rdcd is None or self.rdcd.has(capability)
+        if self.rdcd is None:
+            return True
+        required = self.rdcd.required_for_motion()
+        if required:
+            return capability in required
+        return self.rdcd.has(capability)
 
     def check_for_motion(self) -> dict[str, Any]:
         """Fail closed: deny motion unless required evidence is present and healthy.
@@ -480,6 +679,24 @@ TEST_CATALOG = {
         "description": "Run graph, diagnostics, battery, joint-state, ros2_control, IMU and odometry checks and aggregate the result.",
         "writes": False,
     },
+    "baseline_health": {
+        "name": "Baseline drift health",
+        "description": "Compare current joint-state rate and IMU attitude/acceleration against the rolling baseline and flag drift beyond 3σ (WARN) / 5σ (FAIL). Builds the baseline on first runs.",
+        "writes": False,
+        "requires": "joint_states",
+    },
+    "odometry_vs_imu": {
+        "name": "Odometry vs IMU consistency",
+        "description": "Cross-check odometry pose/twist against IMU orientation/angular-velocity; disagreement beyond thresholds indicates sensor fault, calibration error or slip.",
+        "writes": False,
+        "requires": ["odometry", "imu"],
+    },
+    "cmd_vel_vs_motion": {
+        "name": "Commanded vs observed motion",
+        "description": "Compare velocity commands against observed odometry twist; flags commands that produced no motion (stalled/blocked) or far less motion than commanded (slip).",
+        "writes": False,
+        "requires": ["velocity_command", "odometry"],
+    },
 }
 
 
@@ -492,6 +709,7 @@ class TestRunner:
         max_battery_age_s: float = 5.0,
         min_battery_pct: float = 0.10,
         rdcd: Rdcd | None = None,
+        baseline: BaselineStore | None = None,
     ):
         self.node = node
         self.history = history
@@ -499,20 +717,32 @@ class TestRunner:
         self.max_battery_age_s = max_battery_age_s
         self.min_battery_pct = min_battery_pct
         self.rdcd = rdcd
+        self.baseline = baseline
 
     @staticmethod
     def _severity(result: str) -> int:
         return {"PASS": 0, "NOT_SUPPORTED": 0, "SKIP": 1, "WARN": 2, "FAIL": 3}.get(result, 3)
 
-    def _requires(self, test_id: str) -> str | None:
+    def _requires(self, test_id: str) -> str | list[str] | None:
         return TEST_CATALOG[test_id].get("requires")
 
     def _not_supported(self, test_id: str) -> tuple[str, str, list[dict[str, Any]]] | None:
-        """Return (result, summary, evidence) when a test's capability is not
-        declared by the active RDCD; None when the test is applicable."""
+        """Return (result, summary, evidence) when a test's required capability
+        is not declared by the active RDCD; None when the test is applicable.
+
+        A test may require several capabilities (e.g. ``odometry_vs_imu`` needs
+        both odometry and imu); it is NOT_SUPPORTED when any one is undeclared.
+        """
         req = self._requires(test_id)
-        if req is not None and self.rdcd is not None and not self.rdcd.has(req):
-            summary = f"{req} telemetry is not supported by the {self.rdcd.name} RDCD."
+        if req is None or self.rdcd is None:
+            return None
+        required = [req] if isinstance(req, str) else list(req)
+        missing = [c for c in required if not self.rdcd.has(c)]
+        if missing:
+            summary = (
+                f"{', '.join(missing)} telemetry is not supported by "
+                f"the {self.rdcd.name} RDCD."
+            )
             return ("NOT_SUPPORTED", summary, [])
         return None
 
@@ -550,8 +780,14 @@ class TestRunner:
         started_iso = now_iso()
         started = time.monotonic()
         try:
-            method = getattr(self, f"_test_{test_id}")
-            result, summary, evidence = method()
+            # Plugin tests registered at runtime take precedence over built-in
+            # ``_test_<id>`` methods, so third parties can add checks without
+            # forking the harness.
+            if test_id in _PLUGIN_TEST_FNS:
+                result, summary, evidence = _PLUGIN_TEST_FNS[test_id](self)
+            else:
+                method = getattr(self, f"_test_{test_id}")
+                result, summary, evidence = method()
         except Exception as exc:  # noqa: BLE001
             result, summary, evidence = (
                 "FAIL",
@@ -857,6 +1093,218 @@ class TestRunner:
             return "WARN", "; ".join(problems) + ".", evidence
         return "PASS", f"Velocity commands within bounds (peak {linear_peak:.2f} m/s, {angular_peak:.2f} rad/s).", evidence
 
+    @staticmethod
+    def _peak_suffix(stats: dict[str, Any], *suffixes: str) -> float:
+        """Peak absolute value of any statistic whose path ends with a suffix.
+
+        Suffix matching keeps this robust to message nesting (e.g. odometry's
+        ``twist.twist.linear.x`` vs a bare Twist's ``linear.x``).
+        """
+        best = 0.0
+        for path, v in stats.items():
+            if not isinstance(v, dict) or not any(path.endswith(s) for s in suffixes):
+                continue
+            lo = _finite(v.get("min"))
+            hi = _finite(v.get("max"))
+            best = max(best, abs(lo or 0.0), abs(hi or 0.0))
+        return best
+
+    def _test_baseline_health(self) -> tuple[str, str, list[dict[str, Any]]]:
+        if self.baseline is None:
+            return "SKIP", "Baseline store is not configured.", []
+
+        metrics: list[tuple[str, float]] = []
+        evidence: list[dict[str, Any]] = []
+
+        js_topic = self._capability_topic("joint_states", "/joint_states")
+        js = self.node.sample_topic(js_topic, duration_s=2.5, rate_hz=10.0)
+        evidence.append(asdict(Evidence(js_topic, "sample", js, now_iso())))
+        if not js.get("ok"):
+            return "FAIL", f"Joint-state sampling failed: {js.get('error')}", evidence
+        if js.get("samples", 0) >= 2:
+            metrics.append(("joint_states.rate_hz", float(js.get("effective_rate_hz", 0.0) or 0.0)))
+
+        if self.rdcd is None or self.rdcd.has("imu"):
+            imu_topic = self._capability_topic("imu", "/imu/data")
+            if imu_topic:
+                s = self.node.sample_topic(imu_topic, duration_s=2.0, rate_hz=20.0)
+                evidence.append(asdict(Evidence(imu_topic, "sample", s, now_iso())))
+                if s.get("ok"):
+                    last = s.get("last", {}) if isinstance(s.get("last"), dict) else {}
+                    accel = last.get("linear_acceleration") or {}
+                    axyz = [_finite(accel.get(k)) for k in ("x", "y", "z")]
+                    if all(v is not None for v in axyz):
+                        metrics.append(("imu.accel_mag", math.sqrt(sum(v * v for v in axyz))))
+                    orient = last.get("orientation") or {}
+                    q = [_finite(orient.get(k)) for k in ("x", "y", "z", "w")]
+                    if all(v is not None for v in q):
+                        metrics.append(("imu.quat_norm", math.sqrt(sum(v * v for v in q))))
+
+        if self.rdcd is None or self.rdcd.has("odometry"):
+            odom_topic = self._capability_topic("odometry", "/odom")
+            if odom_topic:
+                s = self.node.sample_topic(odom_topic, duration_s=2.0, rate_hz=10.0)
+                evidence.append(asdict(Evidence(odom_topic, "sample", s, now_iso())))
+                if s.get("ok"):
+                    last = s.get("last", {}) if isinstance(s.get("last"), dict) else {}
+                    pose = ((last.get("pose") or {}).get("pose") or {})
+                    orient = pose.get("orientation") or {}
+                    q = [_finite(orient.get(k)) for k in ("x", "y", "z", "w")]
+                    if all(v is not None for v in q):
+                        metrics.append(("odometry.quat_norm", math.sqrt(sum(v * v for v in q))))
+
+        if not metrics:
+            return "SKIP", "No baselinable metrics could be measured.", evidence
+
+        comparisons = [self.baseline.compare(m, v) for m, v in metrics]
+        for m, v in metrics:
+            self.baseline.observe(m, v)
+        evidence.extend(
+            asdict(Evidence("baseline", c["metric"], c, now_iso())) for c in comparisons
+        )
+
+        established = [
+            c for c in comparisons
+            if c["n"] >= BASELINE_MIN_SAMPLES and c["sigma"] is not None
+        ]
+        if not established:
+            min_n = min(c["n"] for c in comparisons)
+            behind = ", ".join(
+                f"{c['metric']} n={c['n']}"
+                for c in comparisons
+                if c["n"] == min_n
+            )
+            remaining = max(0, BASELINE_MIN_SAMPLES - min_n)
+            return (
+                "SKIP",
+                f"Baseline not established; recorded {len(metrics)} metric(s) this run "
+                f"(minimum prior count {min_n}/{BASELINE_MIN_SAMPLES}: {behind}). "
+                f"Run baseline_health {remaining} more time(s) to establish.",
+                evidence,
+            )
+
+        worst = max(established, key=lambda c: c["sigma"])
+        sigma = worst["sigma"]
+        detail = ", ".join(
+            f"{c['metric']}={c['sigma']}σ"
+            for c in sorted(established, key=lambda c: -c["sigma"])[:6]
+        )
+        if sigma > BASELINE_FAIL_SIGMA:
+            return "FAIL", f"Baseline drift: {worst['metric']} at {sigma:.1f}σ ({detail}).", evidence
+        if sigma > BASELINE_WARN_SIGMA:
+            return "WARN", f"Baseline drift: {worst['metric']} at {sigma:.1f}σ ({detail}).", evidence
+        return "PASS", f"No significant drift (max {sigma:.1f}σ across {len(established)} metric(s)).", evidence
+
+    def _test_odometry_vs_imu(self) -> tuple[str, str, list[dict[str, Any]]]:
+        declared = self.rdcd is not None
+        odom_topic = self._capability_topic("odometry", "/odom")
+        imu_topic = self._capability_topic("imu", "/imu/data")
+        odom_s = self.node.sample_topic(odom_topic, duration_s=2.0, rate_hz=10.0)
+        imu_s = self.node.sample_topic(imu_topic, duration_s=2.0, rate_hz=10.0)
+        evidence = [
+            asdict(Evidence(odom_topic, "sample", odom_s, now_iso())),
+            asdict(Evidence(imu_topic, "sample", imu_s, now_iso())),
+        ]
+        if not odom_s.get("ok") or not imu_s.get("ok"):
+            if declared:
+                which = "Odometry" if not odom_s.get("ok") else "IMU"
+                return "FAIL", f"{which} stream unavailable in the declared RDCD.", evidence
+            return "SKIP", "Odometry/IMU cross-check needs both streams; not discovered in generic mode.", evidence
+
+        odom_last = odom_s.get("last", {}) if isinstance(odom_s.get("last"), dict) else {}
+        imu_last = imu_s.get("last", {}) if isinstance(imu_s.get("last"), dict) else {}
+        odom_orient = (((odom_last.get("pose") or {}).get("pose") or {}).get("orientation")) or {}
+        imu_orient = imu_last.get("orientation") or {}
+
+        q_odom = [_finite(odom_orient.get(k)) for k in ("x", "y", "z", "w")]
+        q_imu = [_finite(imu_orient.get(k)) for k in ("x", "y", "z", "w")]
+        if any(v is None for v in q_odom) or any(v is None for v in q_imu):
+            if declared:
+                return "FAIL", "Missing orientation quaternion fields in odometry/IMU.", evidence
+            return "SKIP", "Sampled topics do not carry odometry/IMU orientation fields; skipped.", evidence
+
+        r_odom, p_odom, _ = _quat_to_rpy(*q_odom)
+        r_imu, p_imu, _ = _quat_to_rpy(*q_imu)
+        roll_dev = abs(_angle_diff_deg(math.degrees(r_odom), math.degrees(r_imu)))
+        pitch_dev = abs(_angle_diff_deg(math.degrees(p_odom), math.degrees(p_imu)))
+
+        odom_ang = (odom_last.get("twist") or {}).get("twist") or {}
+        odom_ang_z = _finite((odom_ang.get("angular") or {}).get("z"))
+        imu_ang_z = _finite((imu_last.get("angular_velocity") or {}).get("z"))
+        ang_dev = abs(odom_ang_z - imu_ang_z) if (odom_ang_z is not None and imu_ang_z is not None) else None
+
+        problems: list[str] = []
+        hard = False
+        if roll_dev > ODOM_IMU_ROLL_PITCH_FAIL_DEG:
+            hard = True
+            problems.append(f"roll mismatch {roll_dev:.1f}°")
+        elif roll_dev > ODOM_IMU_ROLL_PITCH_WARN_DEG:
+            problems.append(f"roll mismatch {roll_dev:.1f}°")
+        if pitch_dev > ODOM_IMU_ROLL_PITCH_FAIL_DEG:
+            hard = True
+            problems.append(f"pitch mismatch {pitch_dev:.1f}°")
+        elif pitch_dev > ODOM_IMU_ROLL_PITCH_WARN_DEG:
+            problems.append(f"pitch mismatch {pitch_dev:.1f}°")
+        if ang_dev is not None:
+            if ang_dev > ODOM_IMU_ANGULAR_FAIL_RAD_S:
+                hard = True
+                problems.append(f"angular-rate mismatch {ang_dev:.3f} rad/s")
+            elif ang_dev > ODOM_IMU_ANGULAR_WARN_RAD_S:
+                problems.append(f"angular-rate mismatch {ang_dev:.3f} rad/s")
+
+        if hard:
+            return "FAIL", "; ".join(problems) + ".", evidence
+        if problems:
+            return "WARN", "; ".join(problems) + ".", evidence
+        return "PASS", f"Odometry and IMU agree (roll Δ{roll_dev:.1f}°, pitch Δ{pitch_dev:.1f}°).", evidence
+
+    def _test_cmd_vel_vs_motion(self) -> tuple[str, str, list[dict[str, Any]]]:
+        cmd_topic = self._capability_topic("velocity_command", "/cmd_vel")
+        odom_topic = self._capability_topic("odometry", "/odom")
+        cmd_s = self.node.sample_topic(cmd_topic, duration_s=1.5, rate_hz=20.0)
+        odom_s = self.node.sample_topic(odom_topic, duration_s=1.5, rate_hz=20.0)
+        evidence = [
+            asdict(Evidence(cmd_topic, "sample", cmd_s, now_iso())),
+            asdict(Evidence(odom_topic, "sample", odom_s, now_iso())),
+        ]
+        if not cmd_s.get("ok"):
+            err = cmd_s.get("error", "")
+            if "no samples" in err or "no message" in err:
+                return "PASS", "No velocity commands observed; robot is at rest.", evidence
+            return "FAIL", f"Velocity-command stream unavailable: {err}", evidence
+
+        cmd_stats = cmd_s.get("statistics") or {}
+        cmd_linear = self._peak_suffix(cmd_stats, "linear.x", "linear.y", "linear.z")
+        cmd_angular = self._peak_suffix(cmd_stats, "angular.x", "angular.y", "angular.z")
+        cmd_peak = max(cmd_linear, cmd_angular)
+
+        if cmd_peak < CMD_VS_MOTION_CMD_THRESHOLD:
+            return "PASS", "Robot at rest (no meaningful velocity command).", evidence
+
+        if not odom_s.get("ok"):
+            return "WARN", f"Command peak {cmd_peak:.2f} but odometry unavailable to confirm motion.", evidence
+
+        odom_stats = odom_s.get("statistics") or {}
+        odom_linear = self._peak_suffix(odom_stats, "linear.x", "linear.y", "linear.z")
+        odom_angular = self._peak_suffix(odom_stats, "angular.x", "angular.y", "angular.z")
+        odom_peak = max(odom_linear, odom_angular)
+
+        if odom_peak < CMD_VS_MOTION_MOTION_THRESHOLD:
+            return "FAIL", (
+                f"Velocity command peak {cmd_peak:.2f} produced no odometry motion "
+                "(stalled/blocked?)."
+            ), evidence
+
+        if cmd_linear > CMD_VS_MOTION_CMD_THRESHOLD:
+            ratio = odom_linear / cmd_linear
+            if ratio < CMD_VS_MOTION_RESPONSE_RATIO:
+                return "WARN", (
+                    f"Observed motion ({odom_linear:.3f} m/s) far below commanded "
+                    f"({cmd_linear:.3f} m/s) — possible slip/stall."
+                ), evidence
+
+        return "PASS", f"Commanded motion ({cmd_peak:.2f}) matched by odometry ({odom_peak:.2f}).", evidence
+
     def _test_declared_capability_check(self) -> tuple[str, str, list[dict[str, Any]]]:
         if self.rdcd is None:
             return "SKIP", "No RDCD loaded; declared-capability validation is not applicable.", []
@@ -892,6 +1340,8 @@ class TestRunner:
             "ros2_control_health",
             "imu_health",
             "odometry_health",
+            "odometry_vs_imu",
+            "cmd_vel_vs_motion",
         ]
         sub_results = []
         for sid in sub_ids:
@@ -923,6 +1373,77 @@ class TestRunner:
             for x in sub_results
         )
         return overall, summary, sub_results
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Plugin test registry
+# ──────────────────────────────────────────────────────────────────────────────
+_PLUGIN_TEST_GROUP = "robodiag.tests"
+
+# test_id → callable(TestRunner) -> (result, summary, evidence). Plugin tests are
+# resolved in TestRunner.run before the built-in ``_test_<id>`` methods, so third
+# parties can add deterministic checks without forking the harness.
+_PLUGIN_TEST_FNS: dict[str, Any] = {}
+
+
+def register_test(
+    test_id: str,
+    name: str,
+    description: str,
+    fn: Any,
+    requires: str | list[str] | None = None,
+    writes: bool = False,
+) -> None:
+    """Register a plugin health test into the deterministic catalog.
+
+    ``fn`` is called as ``fn(TestRunner)`` and must return
+    ``(result, summary, evidence)`` with the same contract as the built-in
+    ``_test_*`` methods.
+    """
+    spec: dict[str, Any] = {
+        "name": name,
+        "description": description,
+        "writes": bool(writes),
+    }
+    if requires:
+        spec["requires"] = requires
+    TEST_CATALOG[test_id] = spec
+    _PLUGIN_TEST_FNS[test_id] = fn
+
+
+def load_entry_point_tests(group: str = _PLUGIN_TEST_GROUP) -> list[str]:
+    """Discover plugin tests declared via ``robodiag.tests`` entry points.
+
+    An entry point must resolve to a callable taking ``TestRunner`` and returning
+    ``(result, summary, evidence)``. Optional attributes on the callable carry
+    metadata: ``name``, ``description``, ``requires``, ``writes``.
+    """
+    try:
+        from importlib import metadata as _ilm
+    except ImportError:  # pragma: no cover - importlib.metadata is stdlib 3.8+
+        return []
+    try:
+        eps = _ilm.entry_points(group=group)
+    except TypeError:  # pragma: no cover - Python < 3.10 returns a dict-like
+        eps = _ilm.entry_points().get(group, [])
+    loaded: list[str] = []
+    for ep in eps:
+        try:
+            fn = ep.load()
+        except Exception:  # noqa: BLE001
+            continue
+        if not callable(fn):
+            continue
+        register_test(
+            ep.name,
+            getattr(fn, "name", ep.name),
+            getattr(fn, "description", ""),
+            fn,
+            getattr(fn, "requires", None),
+            getattr(fn, "writes", False),
+        )
+        loaded.append(ep.name)
+    return loaded
 
 
 # ──────────────────────────────────────────────────────────────────────────────

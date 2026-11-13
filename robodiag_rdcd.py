@@ -25,7 +25,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-SUPPORTED_SCHEMA_VERSION = "0.1"
+SUPPORTED_SCHEMA_VERSIONS = ("0.1", "0.2")
+# Retained as a convenient "newest accepted" reference; 0.1 documents are
+# still accepted unchanged so existing RDCD files keep working.
+SUPPORTED_SCHEMA_VERSION = "0.2"
 
 # Capability runtime status. These are deliberately distinct from the test
 # execution results (PASS / WARN / FAIL / SKIP) so that "not applicable" is
@@ -45,6 +48,9 @@ class Capability:
     name: str
     topic: str
     message_type: str
+    required_for_motion: bool = False
+    expected_rate_hz: float | None = None
+    description: str = ""
 
 
 class Rdcd:
@@ -61,10 +67,10 @@ class Rdcd:
             raise RdcdError("RDCD document must be a mapping")
 
         version = data.get("schema_version")
-        if str(version) != SUPPORTED_SCHEMA_VERSION:
+        if str(version) not in SUPPORTED_SCHEMA_VERSIONS:
             raise RdcdError(
                 f"unsupported schema_version {version!r} "
-                f"(expected {SUPPORTED_SCHEMA_VERSION!r})"
+                f"(expected one of {SUPPORTED_SCHEMA_VERSIONS})"
             )
 
         robot = data.get("robot")
@@ -89,8 +95,26 @@ class Rdcd:
                 raise RdcdError(
                     f"capability {cap_name!r} requires both 'topic' and 'message_type'"
                 )
+            required_for_motion = spec.get("required_for_motion", False)
+            if not isinstance(required_for_motion, bool):
+                raise RdcdError(
+                    f"capability {cap_name!r}: 'required_for_motion' must be a boolean"
+                )
+            expected_rate_hz = spec.get("expected_rate_hz")
+            if expected_rate_hz is not None:
+                try:
+                    expected_rate_hz = float(expected_rate_hz)
+                except (TypeError, ValueError):
+                    raise RdcdError(
+                        f"capability {cap_name!r}: 'expected_rate_hz' must be numeric"
+                    )
             capabilities[str(cap_name)] = Capability(
-                str(cap_name), str(topic), str(message_type)
+                str(cap_name),
+                str(topic),
+                str(message_type),
+                required_for_motion=required_for_motion,
+                expected_rate_hz=expected_rate_hz,
+                description=str(spec.get("description", "")),
             )
         return cls(str(robot_id), str(name), capabilities)
 
@@ -102,6 +126,19 @@ class Rdcd:
 
     def declared(self) -> list[str]:
         return sorted(self.capabilities)
+
+    def required_for_motion(self) -> list[str]:
+        """Capabilities declared as required safety evidence for motion.
+
+        Returns ``[]`` when the RDCD does not mark any capability as
+        ``required_for_motion``; the harness then falls back to treating every
+        declared capability as required (the historical generic assumption).
+        """
+        return sorted(
+            name
+            for name, cap in self.capabilities.items()
+            if cap.required_for_motion
+        )
 
 
 def _scalar(value: str) -> Any:
@@ -164,6 +201,48 @@ def parse_rdcd_yaml(text: str) -> dict[str, Any]:
             stack.append((child, indent))
 
     return root
+
+
+def validate_rdcd(data: dict[str, Any]) -> list[str]:
+    """Validate an RDCD document without raising; return a list of problems.
+
+    An empty list means the document is acceptable to ``Rdcd.from_dict``. Kept
+    separate so tools (e.g. an RDCD generator) can report every problem at once
+    instead of stopping on the first error.
+    """
+    errors: list[str] = []
+    if not isinstance(data, dict):
+        return ["RDCD document must be a mapping"]
+
+    version = data.get("schema_version")
+    if str(version) not in SUPPORTED_SCHEMA_VERSIONS:
+        errors.append(
+            f"unsupported schema_version {version!r} "
+            f"(expected one of {SUPPORTED_SCHEMA_VERSIONS})"
+        )
+
+    robot = data.get("robot")
+    if not isinstance(robot, dict):
+        errors.append("'robot' section is missing or not a mapping")
+    elif not robot.get("id"):
+        errors.append("robot.id is required")
+
+    caps = data.get("capabilities")
+    if not isinstance(caps, dict):
+        errors.append("'capabilities' section must be a mapping")
+    else:
+        for name, spec in caps.items():
+            if not isinstance(spec, dict):
+                errors.append(f"capability {name!r} must be a mapping")
+                continue
+            if not spec.get("topic"):
+                errors.append(f"capability {name!r} requires 'topic'")
+            if not spec.get("message_type"):
+                errors.append(f"capability {name!r} requires 'message_type'")
+            rfm = spec.get("required_for_motion")
+            if rfm is not None and not isinstance(rfm, bool):
+                errors.append(f"capability {name!r}: 'required_for_motion' must be boolean")
+    return errors
 
 
 def load_rdcd(path: str | Path) -> Rdcd:

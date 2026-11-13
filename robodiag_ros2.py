@@ -50,15 +50,39 @@ REPL commands
     /tests
     /run joint_states_health
     /history 10
+    /baseline
     /rdcd
+    /rdcd-guess
+    /timeline 20
     /stop
     /quit
 
 Environment variables
 ---------------------
+    # LLM — any OpenAI-compatible API (OpenAI, DeepSeek, DashScope, ...)
+    LLM_API_KEY
+    LLM_BASE_URL=https://api.deepseek.com
+    LLM_MODEL=deepseek-chat
+
+    # OpenAI SDK-style aliases (also accepted)
+    OPENAI_API_KEY
+    OPENAI_BASE_URL=https://api.openai.com/v1
+    OPENAI_MODEL=gpt-4o-mini
+
+    # Legacy DeepSeek names (still accepted)
     DEEPSEEK_API_KEY
     DEEPSEEK_BASE_URL=https://api.deepseek.com
     DEEPSEEK_MODEL=deepseek-chat
+
+    # Jev (System 1 router)
+    JEV_API_KEY
+    JEV_BASE_URL=https://api.typesafe.ai
+    JEV_MODEL=jev-latest
+
+    # Legacy TypeSafe names (still accepted)
+    TYPESAFE_API_KEY
+    TYPESAFE_BASE_URL=https://api.typesafe.ai
+    TYPESAFE_MODEL=jev-latest
 
     ROBODIAG_MIN_BATTERY_PCT=0.10
     ROBODIAG_MIN_BATTERY_V=0.0
@@ -78,6 +102,7 @@ import re
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable
 
@@ -109,6 +134,7 @@ from robodiag_core import (
     DIAG_ERROR,
     DIAG_OK,
     DIAG_WARN,
+    BaselineStore,
     HistoryStore,
     SafetyGate,
     TEST_CATALOG,
@@ -119,7 +145,9 @@ from robodiag_core import (
     compact,
     is_constant_zero,
     is_verify_request,
+    load_entry_point_tests,
     now_iso,
+    register_test,
     sample_activity_summary,
     stats_from_samples,
 )
@@ -133,6 +161,7 @@ from robodiag_rdcd import (
     RdcdError,
     capability_status,
     load_rdcd,
+    validate_rdcd,
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -189,6 +218,7 @@ except ImportError as exc:
 try:
     from diagnostic_msgs.msg import DiagnosticArray
     from geometry_msgs.msg import Twist
+    from rcl_interfaces.msg import Log
     from sensor_msgs.msg import BatteryState, JointState, Imu
     from std_srvs.srv import Trigger
     from rosidl_runtime_py.convert import message_to_ordereddict
@@ -291,9 +321,17 @@ def load_env(path: Path) -> dict[str, str]:
     try:
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                cfg[k.strip()] = v.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            # Drop trailing inline comments, then accept shell-style quotes.
+            v = v.split(" #", 1)[0].strip()
+            if len(v) >= 2 and v[0] in ("'", '"') and v[-1] == v[0]:
+                v = v[1:-1]
+            if k:
+                cfg[k] = v
     except OSError:
         pass
     return cfg
@@ -482,6 +520,12 @@ class HarnessNode(Node):
 
         self.cmd_vel_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
 
+        # /rosout ring buffer for time-aligned evidence (see /timeline).
+        self._timeline_lock = threading.Lock()
+        self._timeline: deque[dict[str, Any]] = deque(maxlen=200)
+        self.rosout_sub = None
+        self._ensure_rosout_subscription()
+
     def _topic_type_map(self) -> dict[str, list[str]]:
         return {name: types for name, types in self.get_topic_names_and_types()}
 
@@ -547,6 +591,44 @@ class HarnessNode(Node):
     @staticmethod
     def diag_level_name(level: int) -> str:
         return {0: "OK", 1: "WARN", 2: "ERROR", 3: "STALE"}.get(level, f"UNKNOWN({level})")
+
+    @staticmethod
+    def rosout_level_name(level: int) -> str:
+        return {10: "DEBUG", 20: "INFO", 30: "WARN", 40: "ERROR", 50: "FATAL"}.get(
+            level, f"LEVEL({level})"
+        )
+
+    def _ensure_rosout_subscription(self) -> None:
+        """Subscribe to /rosout (reliable QoS) for the /timeline ring buffer."""
+        if self.rosout_sub is None:
+            try:
+                self.rosout_sub = self.create_subscription(Log, "/rosout", self._on_rosout, 20)
+            except Exception:  # noqa: BLE001 - rosout is best-effort evidence
+                self.rosout_sub = None
+
+    def _on_rosout(self, msg: Log) -> None:
+        with self._timeline_lock:
+            self._timeline.append({
+                "stamp": now_iso(),
+                "monotonic": time.monotonic(),
+                "level": int(msg.level),
+                "level_name": self.rosout_level_name(int(msg.level)),
+                "name": str(msg.name),
+                "message": (msg.message or "")[:200],
+                "file": str(msg.file),
+                "line": int(msg.line),
+            })
+
+    def get_timeline(self, limit: int = 50) -> dict[str, Any]:
+        """Return the most recent /rosout entries in arrival order."""
+        with self._timeline_lock:
+            entries = list(self._timeline)
+        return {
+            "ok": True,
+            "source": "/rosout",
+            "count": len(entries),
+            "entries": entries[-limit:],
+        }
 
     # ── Graph ────────────────────────────────────────────────────────────────
     def inspect_graph(self) -> dict[str, Any]:
@@ -974,6 +1056,26 @@ TOOLS = [
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_baseline",
+            "description": "Read the rolling baseline statistics (n/mean/std/min/max per metric) used to detect drift from normal. Useful when comparing current values against what the robot normally does.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_timeline",
+            "description": "Read recent /rosout log entries in arrival order (time-aligned evidence) to correlate events around a fault. Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer", "description": "1-200, default 50"}},
+                "required": [],
+            },
+        },
+    },
 ]
 
 
@@ -1033,6 +1135,13 @@ class AgentRuntime:
                 return compact({"ok": True, "items": self.history.recent(int(args.get("limit", 10)))})
             if name == "check_motion_safety":
                 return compact({"ok": True, **self.gate.check_for_motion()})
+            if name == "query_baseline":
+                baseline = self.runner.baseline
+                if baseline is None:
+                    return compact({"ok": False, "error": "baseline store not configured"})
+                return compact({"ok": True, "metrics": baseline.stats()})
+            if name == "get_timeline":
+                return compact(self.node.get_timeline(int(args.get("limit", 50))))
             if name == "emergency_stop":
                 return compact(self.node.emergency_stop())
             return compact({"ok": False, "error": f"unknown tool: {name}"})
@@ -1137,6 +1246,74 @@ _JEV_NONE_TOPIC = "none_of_the_above"  # always offered so Jev is never forced i
 # the harness executes them, and the explainer runs again with the new evidence.
 _JEV_MAX_VERIFY_ROUNDS = 2
 
+# Environment-variable aliases, in priority order (first non-empty value wins).
+# The LLM is any OpenAI-compatible chat/functions API, so we accept the generic
+# LLM_*, the OpenAI SDK's own OPENAI_*, and the legacy DEEPSEEK_* names. Jev
+# accepts JEV_* with the legacy TYPESAFE_* names still working.
+_LLM_API_KEY_ENV = ("LLM_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY")
+_LLM_BASE_URL_ENV = ("LLM_BASE_URL", "OPENAI_BASE_URL", "DEEPSEEK_BASE_URL")
+_LLM_MODEL_ENV = ("LLM_MODEL", "OPENAI_MODEL", "DEEPSEEK_MODEL")
+_JEV_API_KEY_ENV = ("JEV_API_KEY", "TYPESAFE_API_KEY")
+_JEV_BASE_URL_ENV = ("JEV_BASE_URL", "TYPESAFE_BASE_URL")
+_JEV_MODEL_ENV = ("JEV_MODEL", "TYPESAFE_MODEL")
+
+_LLM_DEFAULT_BASE_URL = "https://api.deepseek.com"
+_LLM_DEFAULT_MODEL = "deepseek-chat"
+
+
+def _resolve_env_source(
+    names: tuple[str, ...], env_file: dict[str, str]
+) -> tuple[str, str | None]:
+    """Return ``(value, matched_name)`` for the first non-empty alias.
+
+    Environment variables take priority over the ``~/.robodiag.env`` file, and
+    within each source the aliases are tried in the given order.
+    """
+    for name in names:
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip(), name
+    for name in names:
+        value = env_file.get(name)
+        if value and value.strip():
+            return value.strip(), name
+    return "", None
+
+
+def _resolve_env(names: tuple[str, ...], env_file: dict[str, str], default: str = "") -> str:
+    value, _ = _resolve_env_source(names, env_file)
+    return value or default
+
+
+def _llm_provider_defaults(key_source: str | None) -> tuple[str, str]:
+    """Return ``(base_url, model)`` implied by the matched LLM key variable.
+
+    ``OPENAI_API_KEY`` implies the official OpenAI endpoint and model; every
+    other source (CLI flag, ``LLM_*``, legacy ``DEEPSEEK_*``) keeps the
+    DeepSeek-based built-in defaults for backward compatibility.
+    """
+    if key_source == "OPENAI_API_KEY":
+        return "https://api.openai.com/v1", "gpt-4o-mini"
+    return _LLM_DEFAULT_BASE_URL, _LLM_DEFAULT_MODEL
+
+
+def _normalize_llm_base_url(url: str) -> str:
+    """Normalize an OpenAI-compatible base URL for the OpenAI SDK.
+
+    The SDK appends the operation path (e.g. ``/chat/completions``) to
+    ``base_url``. The official OpenAI endpoint requires the ``/v1`` version
+    prefix, so accept ``https://api.openai.com`` as well as the full
+    ``https://api.openai.com/v1`` form. Other providers are left untouched.
+    """
+    url = url.strip().rstrip("/")
+    if not url:
+        return url
+    host = url.split("://", 1)[-1].split("/", 1)[0].lower()
+    if host.endswith("openai.com") and not url.endswith("/v1"):
+        return url + "/v1"
+    return url
+
+
 def _resolve_jev_settings(
     api_key_override: str | None = None,
     base_url_override: str | None = None,
@@ -1145,9 +1322,9 @@ def _resolve_jev_settings(
     """Resolve Jev settings with the same precedence as the LLM settings:
     CLI flag > environment variable > ~/.robodiag.env > built-in default."""
     env_file = load_env(Path.home() / ".robodiag.env")
-    api_key = api_key_override or os.environ.get("TYPESAFE_API_KEY") or env_file.get("TYPESAFE_API_KEY", "")
-    base_url = base_url_override or os.environ.get("TYPESAFE_BASE_URL") or env_file.get("TYPESAFE_BASE_URL", TYPESAFE_DEFAULT_BASE_URL)
-    model = model_override or os.environ.get("TYPESAFE_MODEL") or env_file.get("TYPESAFE_MODEL", TYPESAFE_DEFAULT_MODEL)
+    api_key = api_key_override or _resolve_env(_JEV_API_KEY_ENV, env_file)
+    base_url = base_url_override or _resolve_env(_JEV_BASE_URL_ENV, env_file, TYPESAFE_DEFAULT_BASE_URL)
+    model = model_override or _resolve_env(_JEV_MODEL_ENV, env_file, TYPESAFE_DEFAULT_MODEL)
     return api_key, base_url, model
 
 
@@ -2132,9 +2309,12 @@ HELP = f"""[bold]RoboDiag ROS 2 Harness v{VERSION}[/bold]
   /tests                         Test catalog
   /run <test_id>                 Run a deterministic test (all read-only in v0.2)
   /history \[n]                  Recent n test runs
+  /baseline                      Show rolling drift baseline (baseline_health)
   /safety                        Show the motion Safety Gate
+  /timeline \[n]                 Recent /rosout log timeline (time-aligned)
   /stop                          Software stop: zero cmd_vel + optional Trigger service
   /rdcd [robot|path|off]        Show or switch the active RDCD
+  /rdcd-guess [robot-id]        Guess an RDCD from the live ROS graph
   /verify                        Continue the last diagnosis with more read-only checks
   /jev                           Show Jev (System 1) routing status
   /help                          Help
@@ -2146,9 +2326,9 @@ Any other input is routed by Jev (System 1) first:
   ACTION    → deterministic read-only test / software stop
   CHAT      → lightweight reply (no tools)
 
-Diagnosis requires TYPESAFE_API_KEY + DEEPSEEK_API_KEY. Simple queries and
-actions work with only TYPESAFE_API_KEY. With only DEEPSEEK_API_KEY set, the
-classic LLM function-calling agent is used.
+Diagnosis requires JEV_API_KEY + an LLM key (LLM_API_KEY / OPENAI_API_KEY).
+Simple queries and actions work with only JEV_API_KEY. With only an LLM key
+set, the classic LLM function-calling agent is used.
 """
 
 # Slash commands offered by the completion menu (name, description).
@@ -2163,9 +2343,12 @@ REPL_COMMANDS: list[tuple[str, str]] = [
     ("/tests", "Test catalog"),
     ("/run", "Run a deterministic test"),
     ("/history", "Recent test runs"),
+    ("/baseline", "Show rolling drift baseline"),
     ("/safety", "Show the motion Safety Gate"),
+    ("/timeline", "Recent /rosout log timeline"),
     ("/stop", "Software stop (zero cmd_vel + optional Trigger)"),
     ("/rdcd", "Show or switch the robot's diagnostic capabilities (RDCD)"),
+    ("/rdcd-guess", "Guess an RDCD from the live ROS graph"),
     ("/verify", "Continue the last diagnosis with more read-only checks"),
     ("/jev", "Show Jev (System 1) routing status"),
     ("/quit", "Quit"),
@@ -2407,7 +2590,13 @@ def print_rdcd(rdcd: Rdcd | None, topic_types: dict[str, list[str]]) -> None:
                 f"     [yellow]status: TYPE_MISMATCH[/yellow]"
             )
 
-    required = {spec.get("requires") for spec in TEST_CATALOG.values() if spec.get("requires")}
+    required: set[str] = set()
+    for spec in TEST_CATALOG.values():
+        req = spec.get("requires")
+        if isinstance(req, str):
+            required.add(req)
+        elif req:
+            required.update(req)
     unsupported = sorted(required - set(rdcd.declared()))
     if unsupported:
         console.print("\n[bold]Not supported[/bold]\n")
@@ -2418,6 +2607,97 @@ def print_rdcd(rdcd: Rdcd | None, topic_types: dict[str, list[str]]) -> None:
 def confirm_stop() -> bool:
     # /stop is intentionally explicit in CLI, so no extra yes/no confirmation is needed.
     return True
+
+
+def print_baseline(baseline: Any) -> None:
+    if baseline is None:
+        console.print("[yellow]Baseline store is not configured.[/yellow]")
+        return
+    rows = baseline.stats()
+    if not rows:
+        console.print("[yellow]No baseline recorded yet. Run /run baseline_health first.[/yellow]")
+        return
+    t = Table(title="Drift Baseline", border_style="#00E5FF")
+    for c in ("Metric", "n", "mean", "std", "min", "max"):
+        t.add_column(c, overflow="fold")
+    for r in rows:
+        t.add_row(
+            r["metric"],
+            str(r["n"]),
+            str(r["mean"]),
+            "—" if r["std"] is None else str(r["std"]),
+            str(r["min"]),
+            str(r["max"]),
+        )
+    console.print(t)
+
+
+def print_timeline(tl: dict[str, Any]) -> None:
+    entries = tl.get("entries", [])
+    if not entries:
+        console.print("[yellow]No /rosout entries received yet.[/yellow]")
+        return
+    t = Table(
+        title=f"/rosout timeline · {tl.get('count', len(entries))} entries "
+              f"(showing last {len(entries)})",
+        border_style="#00E5FF",
+    )
+    for c in ("Level", "Name", "Message"):
+        t.add_column(c, overflow="fold")
+    colors = {"DEBUG": "dim", "INFO": "white", "WARN": "yellow", "ERROR": "red", "FATAL": "red"}
+    for e in entries:
+        level = e.get("level_name", "?")
+        t.add_row(
+            f"[{colors.get(level, 'white')}]{level}[/]",
+            e.get("name", ""),
+            (e.get("message") or "")[:120],
+        )
+    console.print(t)
+
+
+# Conventional capability → topic/type pairs used by /rdcd-guess.
+_RDCD_GUESS_PATTERNS: list[tuple[str, str, str]] = [
+    ("diagnostics", "/diagnostics", "diagnostic_msgs/msg/DiagnosticArray"),
+    ("joint_states", "/joint_states", "sensor_msgs/msg/JointState"),
+    ("imu", "/imu/data", "sensor_msgs/msg/Imu"),
+    ("odometry", "/odom", "nav_msgs/msg/Odometry"),
+    ("battery", "/battery_state", "sensor_msgs/msg/BatteryState"),
+    ("velocity_command", "/cmd_vel", "geometry_msgs/msg/Twist"),
+]
+
+
+def guess_rdcd(node: HarnessNode, robot_id: str = "guessed_robot", name: str | None = None) -> dict[str, Any]:
+    """Infer an RDCD draft from the live ROS graph (deterministic, no AI).
+
+    For each known capability it prefers the conventional topic name and falls
+    back to any topic publishing the expected message type. Motion-required
+    capabilities (diagnostics, joint_states) are marked ``required_for_motion``.
+    """
+    graph = node.inspect_graph()
+    topics = graph.get("topics", []) if isinstance(graph, dict) else []
+    capabilities: dict[str, Any] = {}
+    for cap, conventional, msg_type in _RDCD_GUESS_PATTERNS:
+        topic: str | None = None
+        for t in topics:
+            if t.get("name") == conventional and msg_type in (t.get("types") or []):
+                topic = conventional
+                break
+        if topic is None:
+            for t in topics:
+                if msg_type in (t.get("types") or []):
+                    topic = t.get("name")
+                    break
+        if topic:
+            capabilities[cap] = {
+                "topic": topic,
+                "message_type": msg_type,
+                "required_for_motion": cap in ("diagnostics", "joint_states"),
+            }
+    return {
+        "schema_version": "0.2",
+        "robot": {"id": robot_id, "name": name or robot_id},
+        "capabilities": capabilities,
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2621,6 +2901,20 @@ def repl(
                 console.print_json(json.dumps(result, ensure_ascii=False, default=str))
                 _note_repl_activity(repl_activity, f"/safety → allow={result.get('allow')}")
                 continue
+            if line == "/baseline":
+                print_baseline(runner.baseline)
+                _note_repl_activity(repl_activity, "/baseline → shown")
+                continue
+            if line == "/timeline" or line.startswith("/timeline "):
+                parts = line.split()
+                try:
+                    n = int(parts[1]) if len(parts) > 1 else 50
+                except ValueError:
+                    console.print("[red]Usage: /timeline \[n][/red]")
+                    continue
+                print_timeline(node.get_timeline(n))
+                _note_repl_activity(repl_activity, f"/timeline → {n} entries")
+                continue
             if line == "/stop":
                 if confirm_stop():
                     result = node.emergency_stop()
@@ -2645,7 +2939,7 @@ def repl(
                         "It only routes read-only evidence tools; emergency_stop stays behind /stop."
                     )
                 else:
-                    console.print("[yellow]Jev router disabled. Set TYPESAFE_API_KEY to enable System 1 routing.[/yellow]")
+                    console.print("[yellow]Jev router disabled. Set JEV_API_KEY to enable System 1 routing.[/yellow]")
                 continue
             if line == "/verify":
                 handle_verify()
@@ -2653,6 +2947,22 @@ def repl(
             if line == "/rdcd":
                 print_rdcd(node.rdcd, node._topic_type_map())
                 _note_repl_activity(repl_activity, f"/rdcd → {node.rdcd.name if node.rdcd else 'generic mode'}")
+                continue
+            if line == "/rdcd-guess" or line.startswith("/rdcd-guess "):
+                parts = line.split()
+                robot_id = parts[1] if len(parts) > 1 else "guessed_robot"
+                draft = guess_rdcd(node, robot_id=robot_id)
+                errs = validate_rdcd(draft)
+                if errs:
+                    console.print(f"[red]Guessed RDCD failed validation: {'; '.join(errs)}[/red]")
+                else:
+                    console.print(
+                        f"[green]Guessed RDCD for {robot_id} "
+                        f"({len(draft['capabilities'])} capabilities):[/green]"
+                    )
+                    console.print_json(json.dumps(draft, ensure_ascii=False, default=str))
+                    console.print("[dim]Save it to rdcd/<id>.yaml and load with /rdcd <id>.[/dim]")
+                _note_repl_activity(repl_activity, f"/rdcd-guess → {len(draft['capabilities'])} capabilities")
                 continue
             if line.startswith("/rdcd "):
                 arg = line.split(maxsplit=1)[1].strip()
@@ -2712,7 +3022,7 @@ def repl(
                 # DIAGNOSIS — the existing Jev evidence loop + LLM explainer.
                 if jev_router is None:
                     if llm_client is None:
-                        console.print("[red]AI Agent not configured. Set DEEPSEEK_API_KEY to enable natural-language diagnosis.[/red]")
+                        console.print("[red]AI Agent not configured. Set LLM_API_KEY or OPENAI_API_KEY to enable natural-language diagnosis.[/red]")
                         continue
                     chat_history = agent_turn(
                         runtime,
@@ -2722,7 +3032,7 @@ def repl(
                     )
                     continue
                 if llm_client is None:
-                    console.print("[red]Jev router is on, but the LLM explainer is not. Set DEEPSEEK_API_KEY to enable the final diagnosis.[/red]")
+                    console.print("[red]Jev router is on, but the LLM explainer is not. Set LLM_API_KEY or OPENAI_API_KEY to enable the final diagnosis.[/red]")
                     continue
                 state, explanation, more = run_jev_diagnosis(
                     runtime, jev_router, llm_client, model,
@@ -2738,7 +3048,7 @@ def repl(
 
             # No Jev request router: preserve the classic LLM function-calling agent.
             if llm_client is None:
-                console.print("[red]AI Agent not configured. Set DEEPSEEK_API_KEY to enable natural-language diagnosis.[/red]")
+                console.print("[red]AI Agent not configured. Set LLM_API_KEY or OPENAI_API_KEY to enable natural-language diagnosis.[/red]")
                 continue
             chat_history = agent_turn(
                 runtime,
@@ -2763,16 +3073,20 @@ def build_llm_client(
 ) -> tuple[Any | None, str]:
     env_file = load_env(Path.home() / ".robodiag.env")
     # Precedence: CLI flag > environment variable > ~/.robodiag.env > built-in default.
-    api_key = api_key_override or os.environ.get("DEEPSEEK_API_KEY") or env_file.get("DEEPSEEK_API_KEY", "")
-    base_url = base_url_override or os.environ.get("DEEPSEEK_BASE_URL") or env_file.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    model = model_override or os.environ.get("DEEPSEEK_MODEL") or env_file.get("DEEPSEEK_MODEL", "deepseek-chat")
+    env_key, key_source = _resolve_env_source(_LLM_API_KEY_ENV, env_file)
+    api_key = api_key_override or env_key
+    if api_key_override:
+        key_source = None  # CLI key: keep the built-in provider defaults
+    default_base, default_model = _llm_provider_defaults(key_source)
+    base_url = base_url_override or _resolve_env(_LLM_BASE_URL_ENV, env_file, default_base)
+    model = model_override or _resolve_env(_LLM_MODEL_ENV, env_file, default_model)
     if not api_key or "your-api-key" in api_key:
         return None, model
     if OpenAI is None:
         console.print("[yellow]API key detected, but the 'openai' Python package is missing. Run: pip install openai[/yellow]")
         return None, model
     try:
-        return OpenAI(api_key=api_key, base_url=base_url), model
+        return OpenAI(api_key=api_key, base_url=_normalize_llm_base_url(base_url)), model
     except Exception as exc:  # noqa: BLE001
         console.print(f"[yellow]AI Agent initialization failed; disabled: {type(exc).__name__}: {exc}[/yellow]")
         return None, model
@@ -2811,18 +3125,18 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="robot diagnostic capability description: a robot id (e.g. mini_pupper_2) or a path to an RDCD YAML file",
     )
-    parser.add_argument("--model", default="", help="LLM model name; overrides DEEPSEEK_MODEL")
-    parser.add_argument("--base-url", default="", help="OpenAI-compatible base URL; overrides DEEPSEEK_BASE_URL")
+    parser.add_argument("--model", default="", help="LLM model name; overrides LLM_MODEL/OPENAI_MODEL/DEEPSEEK_MODEL")
+    parser.add_argument("--base-url", default="", help="OpenAI-compatible base URL; overrides LLM_BASE_URL/OPENAI_BASE_URL/DEEPSEEK_BASE_URL")
     parser.add_argument(
         "--api-key",
         default="",
-        help="LLM API key; overrides DEEPSEEK_API_KEY (WARNING: visible in `ps` and shell history)",
+        help="LLM API key; overrides LLM_API_KEY/OPENAI_API_KEY/DEEPSEEK_API_KEY (WARNING: visible in `ps` and shell history)",
     )
     parser.add_argument("--api-key-file", default="", help="read the API key from a file (safer than --api-key)")
-    parser.add_argument("--jev-model", default="", help="Jev model name; overrides TYPESAFE_MODEL")
-    parser.add_argument("--jev-base-url", default="", help="TypeSafe base URL; overrides TYPESAFE_BASE_URL")
-    parser.add_argument("--jev-api-key", default="", help="TypeSafe API key; overrides TYPESAFE_API_KEY (visible in `ps`/shell history)")
-    parser.add_argument("--jev-api-key-file", default="", help="read the TypeSafe API key from a file (safer than --jev-api-key)")
+    parser.add_argument("--jev-model", default="", help="Jev model name; overrides JEV_MODEL/TYPESAFE_MODEL")
+    parser.add_argument("--jev-base-url", default="", help="Jev base URL; overrides JEV_BASE_URL/TYPESAFE_BASE_URL")
+    parser.add_argument("--jev-api-key", default="", help="Jev API key; overrides JEV_API_KEY/TYPESAFE_API_KEY (visible in `ps`/shell history)")
+    parser.add_argument("--jev-api-key-file", default="", help="read the Jev API key from a file (safer than --jev-api-key)")
     args, ros_unknown = parser.parse_known_args(argv)
 
     try:
@@ -2855,6 +3169,10 @@ def main(argv: list[str] | None = None) -> int:
     node._ensure_common_subscriptions()
 
     history_store = HistoryStore(Path(args.db))
+    baseline_store = BaselineStore(Path(args.db))
+    # Discover third-party deterministic tests declared via ``robodiag.tests``
+    # entry points before building the runner (they extend TEST_CATALOG).
+    load_entry_point_tests()
     gate = SafetyGate(
         node=node,
         min_battery_pct=env_float("ROBODIAG_MIN_BATTERY_PCT", 0.10),
@@ -2871,6 +3189,7 @@ def main(argv: list[str] | None = None) -> int:
         max_battery_age_s=env_float("ROBODIAG_MAX_BATTERY_AGE_S", 5.0),
         min_battery_pct=env_float("ROBODIAG_MIN_BATTERY_PCT", 0.10),
         rdcd=rdcd,
+        baseline=baseline_store,
     )
     runtime = AgentRuntime(node, runner, history_store, gate)
 
@@ -2884,7 +3203,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.api_key:
         console.print(
             "[yellow]Warning: --api-key is visible in `ps` and shell history; "
-            "prefer DEEPSEEK_API_KEY or --api-key-file.[/yellow]"
+            "prefer LLM_API_KEY/OPENAI_API_KEY or --api-key-file.[/yellow]"
         )
     llm_client, model = build_llm_client(
         api_key_override=cli_api_key or None,
@@ -2902,7 +3221,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.jev_api_key:
         console.print(
             "[yellow]Warning: --jev-api-key is visible in `ps` and shell history; "
-            "prefer TYPESAFE_API_KEY or --jev-api-key-file.[/yellow]"
+            "prefer JEV_API_KEY or --jev-api-key-file.[/yellow]"
         )
     jev_router, _jev_model = build_jev_router(
         api_key_override=jev_api_key or None,
@@ -2927,7 +3246,7 @@ def main(argv: list[str] | None = None) -> int:
     console.print(
         f"  🤖 Agent: [bold]{model}[/bold]"
         if llm_client
-        else "  🤖 Agent: [yellow]disabled (DEEPSEEK_API_KEY not found)[/yellow]"
+        else "  🤖 Agent: [yellow]disabled (LLM_API_KEY/OPENAI_API_KEY not found)[/yellow]"
     )
     if request_router:
         console.print(
@@ -2938,7 +3257,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         console.print(
-            "  🧠 Jev router: [yellow]disabled (TYPESAFE_API_KEY not found) — falling back to LLM function calling[/yellow]"
+            "  🧠 Jev router: [yellow]disabled (JEV_API_KEY not found) — falling back to LLM function calling[/yellow]"
         )
     console.print(f"  🗃  History DB: [dim]{Path(args.db).expanduser()}[/dim]\n")
 

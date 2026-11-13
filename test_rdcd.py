@@ -363,5 +363,91 @@ class TestSafetyGateWithRdcd(unittest.TestCase):
         self.assertFalse(result["allow"])
 
 
+class TestRdcdMotionRequirements(unittest.TestCase):
+    def test_required_for_motion(self):
+        yaml = """
+schema_version: 0.2
+robot:
+  id: r
+  name: R
+capabilities:
+  diagnostics:
+    topic: /diagnostics
+    message_type: diagnostic_msgs/msg/DiagnosticArray
+    required_for_motion: true
+  imu:
+    topic: /imu/data
+    message_type: sensor_msgs/msg/Imu
+"""
+        r = rdcd.Rdcd.from_dict(rdcd.parse_rdcd_yaml(yaml))
+        self.assertEqual(r.required_for_motion(), ["diagnostics"])
+        self.assertTrue(r.get("diagnostics").required_for_motion)
+        self.assertFalse(r.get("imu").required_for_motion)
+
+    def test_validate_rdcd_accepts_valid_document(self):
+        self.assertEqual(rdcd.validate_rdcd(rdcd.parse_rdcd_yaml(MINI_PUPPER_YAML)), [])
+
+    def test_validate_rdcd_reports_all_problems(self):
+        bad = {
+            "schema_version": "9.9",
+            "robot": {},
+            "capabilities": {"x": {"topic": "/t"}},
+        }
+        errs = rdcd.validate_rdcd(bad)
+        self.assertTrue(any("schema_version" in e for e in errs))
+        self.assertTrue(any("robot.id" in e for e in errs))
+        self.assertTrue(any("message_type" in e for e in errs))
+
+    def test_validate_rdcd_rejects_non_boolean_required_for_motion(self):
+        data = rdcd.parse_rdcd_yaml(MINI_PUPPER_YAML)
+        data["capabilities"]["imu"]["required_for_motion"] = "yes"
+        errs = rdcd.validate_rdcd(data)
+        self.assertTrue(any("required_for_motion" in e for e in errs))
+
+    def test_schema_02_accepted(self):
+        r = rdcd.Rdcd.from_dict(
+            rdcd.parse_rdcd_yaml(MINI_PUPPER_YAML.replace("schema_version: 0.1", "schema_version: 0.2"))
+        )
+        self.assertEqual(r.robot_id, "mini_pupper_2")
+
+
+class TestSafetyGateRequiredForMotion(unittest.TestCase):
+    @staticmethod
+    def _rdcd_with(required: set) -> rdcd.Rdcd:
+        caps = {
+            "diagnostics": {"topic": "/diagnostics", "message_type": "diagnostic_msgs/msg/DiagnosticArray"},
+            "joint_states": {"topic": "/joint_states", "message_type": "sensor_msgs/msg/JointState"},
+            "battery": {"topic": "/battery_state", "message_type": "sensor_msgs/msg/BatteryState"},
+        }
+        for name in required:
+            caps[name]["required_for_motion"] = True
+        data = {"schema_version": "0.2", "robot": {"id": "r", "name": "R"}, "capabilities": caps}
+        return rdcd.Rdcd.from_dict(data)
+
+    def _gate(self, rdcd_obj):
+        return core.SafetyGate(
+            FakeNode(),
+            min_battery_pct=0.10,
+            min_battery_v=0.0,
+            max_diag_age_s=5.0,
+            max_joint_age_s=1.0,
+            max_battery_age_s=5.0,
+            rdcd=rdcd_obj,
+        )
+
+    def test_unmarked_battery_not_required(self):
+        # battery is declared but NOT marked required_for_motion → not demanded.
+        rdcd_obj = self._rdcd_with({"diagnostics", "joint_states"})
+        result = self._gate(rdcd_obj).check_for_motion()
+        self.assertTrue(result["allow"])
+        self.assertFalse(any(c["check"].startswith("battery") for c in result["checks"]))
+
+    def test_marked_battery_required(self):
+        # battery declared AND marked required → missing battery fails closed.
+        rdcd_obj = self._rdcd_with({"diagnostics", "joint_states", "battery"})
+        result = self._gate(rdcd_obj).check_for_motion()
+        self.assertFalse(result["allow"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

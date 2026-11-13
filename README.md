@@ -100,6 +100,14 @@ Because battery isn't declared, RoboDiag does **not** go hunting for battery tel
 
 Mini Pupper 2 is the first RDCD reference robot.
 
+RDCD documents accept `schema_version` `0.1` or `0.2`. Version 0.2 adds an
+optional `required_for_motion` flag per capability — the Safety Gate only
+requires marked capabilities before motion — plus optional `expected_rate_hz`
+and `description`. Mini Pupper 2 marks `diagnostics` and `joint_states`, so
+missing battery telemetry never blocks motion. Use `/rdcd-guess` to draft a new
+RDCD from the live graph, and add custom tests via `robodiag.tests` entry
+points.
+
 ## Getting started
 
 ### 1. Prepare ROS 2
@@ -202,9 +210,12 @@ Capabilities the RDCD doesn't declare are simply "not supported" for that robot.
 /tests                         Test catalog
 /run <test_id>                 Run a deterministic health test
 /history [n]                   Recent test runs
+/baseline                      Show rolling drift baseline (baseline_health)
 /safety                        Show the motion Safety Gate
+/timeline [n]                  Recent /rosout log timeline (time-aligned)
 /stop                          Request a software stop
 /rdcd [robot|path|off]         Show or switch the active RDCD
+/rdcd-guess [robot-id]         Guess an RDCD from the live ROS graph
 /verify                        Continue the last diagnosis with more read-only checks
 /jev                           Show Jev routing status
 /help                          Help
@@ -243,6 +254,9 @@ Built-in tests:
 | `imu_health` | Sample the IMU; check finite values, quaternion norm, gravity plausibility, covariance |
 | `odometry_health` | Sample odometry; check finite pose/twist, quaternion norm, covariance |
 | `velocity_command_health` | Observe the velocity-command topic; flag non-finite or out-of-bounds commands |
+| `odometry_vs_imu` | Cross-check odometry pose/twist against IMU orientation/angular-rate; disagreement indicates sensor fault, calibration error or slip |
+| `cmd_vel_vs_motion` | Compare velocity commands against observed odometry twist; flags stalled/blocked or slipped motion |
+| `baseline_health` | Compare current joint-state rate and IMU attitude against the rolling baseline; flags drift beyond 3σ (WARN) / 5σ (FAIL) |
 | `declared_capability_check` | Verify every RDCD-declared capability is present with the declared message type |
 | `system_health` | Run the applicable tests and combine the result |
 
@@ -302,11 +316,11 @@ Two routing modes.
 
 ### Classic function calling
 
-With an OpenAI-compatible model configured, the model can request read-only RoboDiag tools, inspect the results, and write a diagnosis. DeepSeek is the default; other OpenAI-compatible endpoints work too.
+With an OpenAI-compatible model configured, the model can request read-only RoboDiag tools, inspect the results, and write a diagnosis. It speaks the OpenAI chat/functions format, so the official OpenAI API, DeepSeek, DashScope, and any other OpenAI-compatible endpoint all work. DeepSeek is the default; point `LLM_BASE_URL` (or `OPENAI_BASE_URL`) at any compatible endpoint.
 
 ### Jev routing
 
-Configure `TYPESAFE_API_KEY` and Jev becomes a fast decision layer with one job:
+Configure `JEV_API_KEY` and Jev becomes a fast decision layer with one job:
 
 ```text
 User request
@@ -384,18 +398,39 @@ built-in defaults
 Example `~/.robodiag.env`:
 
 ```bash
-DEEPSEEK_API_KEY=sk-...
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-chat
+# LLM — any OpenAI-compatible API
+LLM_API_KEY=sk-...
+LLM_BASE_URL=https://api.deepseek.com
+LLM_MODEL=deepseek-chat
 
-TYPESAFE_API_KEY=apikey_...
-TYPESAFE_BASE_URL=https://api.typesafe.ai
-TYPESAFE_MODEL=jev-latest
+# Jev (System 1 router)
+JEV_API_KEY=apikey_...
+JEV_BASE_URL=https://api.typesafe.ai
+JEV_MODEL=jev-latest
 ```
+
+The LLM also accepts the OpenAI SDK's own `OPENAI_API_KEY` /
+`OPENAI_BASE_URL` / `OPENAI_MODEL`, plus the older `DEEPSEEK_*` names. Jev
+accepts the older `TYPESAFE_*` names. Within each group the precedence is
+`LLM_*` → `OPENAI_*` → `DEEPSEEK_*` and `JEV_*` → `TYPESAFE_*`.
+
+If you set only `OPENAI_API_KEY` (no base URL or model), RoboDiag defaults to
+the official OpenAI endpoint (`https://api.openai.com/v1`) and `gpt-4o-mini`.
+For every other LLM key name it keeps the DeepSeek defaults.
 
 Examples:
 
 ```bash
+# Any OpenAI-compatible endpoint via environment variables
+export LLM_API_KEY=sk-...
+export LLM_BASE_URL=https://api.openai.com/v1
+export LLM_MODEL=gpt-4o-mini
+./robodiag
+
+# Or use the OpenAI SDK-style names
+export OPENAI_API_KEY=sk-...
+./robodiag --model gpt-4o-mini
+
 ./robodiag --model deepseek-reasoner
 
 ./robodiag \
@@ -405,7 +440,7 @@ Examples:
 ./robodiag --api-key-file ~/.deepseek.key
 ```
 
-`--api-key` / `--jev-api-key` can leak through shell history or process listings. Prefer environment variables, `~/.robodiag.env`, or key files.
+`--api-key` / `--jev-api-key` can leak through shell history or process listings. Prefer environment variables (`LLM_API_KEY` / `JEV_API_KEY`), `~/.robodiag.env`, or key files.
 
 ## CLI options
 
@@ -416,12 +451,12 @@ Examples:
 | `--cmd-vel-topic` | `/cmd_vel` | Fallback software-stop Twist topic |
 | `--estop-service` | none | Optional Trigger stop service |
 | `--db` | `~/.robodiag_ros2.db` | SQLite history path |
-| `--model` | `deepseek-chat` | LLM model |
-| `--base-url` | `https://api.deepseek.com` | OpenAI-compatible endpoint |
+| `--model` | `deepseek-chat` | LLM model (overrides `LLM_MODEL`/`OPENAI_MODEL`) |
+| `--base-url` | `https://api.deepseek.com` | OpenAI-compatible endpoint (overrides `LLM_BASE_URL`/`OPENAI_BASE_URL`) |
 | `--api-key-file` | none | Read LLM API key from a file |
-| `--jev-model` | `jev-latest` | Jev model |
-| `--jev-base-url` | `https://api.typesafe.ai` | TypeSafe endpoint |
-| `--jev-api-key-file` | none | Read TypeSafe key from a file |
+| `--jev-model` | `jev-latest` | Jev model (overrides `JEV_MODEL`) |
+| `--jev-base-url` | `https://api.typesafe.ai` | Jev endpoint (overrides `JEV_BASE_URL`) |
+| `--jev-api-key-file` | none | Read Jev API key from a file |
 
 ## Health thresholds
 

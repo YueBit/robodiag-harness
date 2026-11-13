@@ -7,8 +7,9 @@ Two layers:
    JevClient is used to prove that RequestRouter.route() maps Jev choices to
    the correct RequestRoute and that unknown capability labels are rejected.
 
-2. Live classification tests (run only when TYPESAFE_API_KEY is available):
-   real Jev calls verify the QUERY / DIAGNOSIS / ACTION cases from the spec.
+2. Live classification tests (run only when JEV_API_KEY / TYPESAFE_API_KEY is
+   available): real Jev calls verify the QUERY / DIAGNOSIS / ACTION cases from
+   the spec.
 
 Usage:
     python3 test_request_router.py
@@ -177,17 +178,24 @@ def main() -> int:
         check(f"detect_language({text!r})", got == expected, got)
     check("LANGUAGE_NAMES resolves zh", LANGUAGE_NAMES.get("zh") == "Chinese", str(LANGUAGE_NAMES.get("zh")))
 
-    # ── Live classification tests (require TYPESAFE_API_KEY) ────────────────
-    api_key = os.environ.get("TYPESAFE_API_KEY", "").strip()
+    # ── Live classification tests (require JEV_API_KEY / TYPESAFE_API_KEY) ──
+    api_key = ""
+    for name in ("JEV_API_KEY", "TYPESAFE_API_KEY"):
+        api_key = os.environ.get(name, "").strip()
+        if api_key:
+            break
     if not api_key:
         env_file = Path.home() / ".robodiag.env"
         if env_file.exists():
             for line in env_file.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
-                if line.startswith("TYPESAFE_API_KEY="):
-                    api_key = line.split("=", 1)[1].strip()
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    if k.strip() in ("JEV_API_KEY", "TYPESAFE_API_KEY") and v.strip():
+                        api_key = v.strip()
+                        break
     if not api_key:
-        print("\nSKIP: no TYPESAFE_API_KEY found; live classification checks skipped")
+        print("\nSKIP: no JEV_API_KEY (or TYPESAFE_API_KEY) found; live classification checks skipped")
         print()
         return 1 if failures else 0
 

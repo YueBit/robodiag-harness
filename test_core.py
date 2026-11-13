@@ -430,5 +430,292 @@ class TestWhitelists(unittest.TestCase):
         self.assertEqual(d.action, "get_diagnostics")
 
 
+class FakeSensorNode:
+    """Returns scripted sample_topic results keyed by absolute topic name."""
+
+    def __init__(self, **by_topic):
+        self.by_topic = by_topic
+
+    def sample_topic(self, topic, duration_s=5.0, rate_hz=5.0):
+        return self.by_topic.get(topic, {"ok": False, "error": "no samples"})
+
+
+def _flat_stat(max_val: float) -> dict:
+    return {"min": 0.0, "max": max_val, "mean": 0.0, "std": 0.0, "range": max_val}
+
+
+def _cmd_sample(linear_x_max: float = 0.0) -> dict:
+    return {
+        "ok": True,
+        "samples": 20,
+        "effective_rate_hz": 20.0,
+        "statistics": {
+            "linear.x": _flat_stat(linear_x_max),
+            "linear.y": _flat_stat(0.0),
+            "linear.z": _flat_stat(0.0),
+            "angular.x": _flat_stat(0.0),
+            "angular.y": _flat_stat(0.0),
+            "angular.z": _flat_stat(0.0),
+        },
+    }
+
+
+def _odom_motion_sample(linear_x_max: float = 0.0) -> dict:
+    return {
+        "ok": True,
+        "samples": 20,
+        "effective_rate_hz": 20.0,
+        "statistics": {
+            "twist.twist.linear.x": _flat_stat(linear_x_max),
+            "twist.twist.linear.y": _flat_stat(0.0),
+            "twist.twist.linear.z": _flat_stat(0.0),
+            "twist.twist.angular.x": _flat_stat(0.0),
+            "twist.twist.angular.y": _flat_stat(0.0),
+            "twist.twist.angular.z": _flat_stat(0.0),
+        },
+    }
+
+
+class TestBaselineStore(unittest.TestCase):
+    def _store(self) -> core.BaselineStore:
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        return core.BaselineStore(Path(d.name) / "b.db")
+
+    def test_observe_and_compare(self):
+        b = self._store()
+        for v in (30.0, 31.0, 29.0, 30.0, 31.0):
+            b.observe("joint_states.rate_hz", v)
+        c = b.compare("joint_states.rate_hz", 30.0)
+        self.assertEqual(c["n"], 5)
+        self.assertAlmostEqual(c["mean"], 30.2, places=5)
+        self.assertLess(c["sigma"], 1.0)  # near the mean
+        drifted = b.compare("joint_states.rate_hz", 45.0)
+        self.assertGreater(drifted["sigma"], 10.0)
+
+    def test_zero_variance_deviation_is_huge(self):
+        b = self._store()
+        for _ in range(5):
+            b.observe("m", 30.0)
+        self.assertEqual(b.compare("m", 30.0)["sigma"], 0.0)
+        self.assertGreater(b.compare("m", 31.0)["sigma"], 1e6)
+
+    def test_stats_and_clear(self):
+        b = self._store()
+        b.observe("a", 1.0)
+        b.observe("b", 2.0)
+        self.assertEqual(len(b.stats()), 2)
+        b.clear()
+        self.assertEqual(b.stats(), [])
+
+    def test_rejects_nonfinite(self):
+        b = self._store()
+        with self.assertRaises(ValueError):
+            b.observe("m", float("nan"))
+
+
+class TestBaselineHealth(unittest.TestCase):
+    @staticmethod
+    def _joint_sample(rate: float) -> dict:
+        return {"ok": True, "samples": 10, "effective_rate_hz": rate,
+                "last": {"_joints": {"a": {"position": 0.0}}}}
+
+    def _runner(self, node, baseline) -> core.TestRunner:
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        return core.TestRunner(
+            node, core.HistoryStore(Path(d.name) / "h.db"), baseline=baseline
+        )
+
+    def test_not_configured_skips(self):
+        node = FakeSensorNode(**{"/joint_states": self._joint_sample(30.0)})
+        with tempfile.TemporaryDirectory() as d:
+            runner = core.TestRunner(node, core.HistoryStore(Path(d) / "h.db"), baseline=None)
+            res = runner.run("baseline_health")
+        self.assertEqual(res["result"], "SKIP")
+
+    def test_not_established_skips(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        baseline = core.BaselineStore(Path(d.name) / "b.db")
+        node = FakeSensorNode(**{"/joint_states": self._joint_sample(30.0)})
+        res = self._runner(node, baseline).run("baseline_health")
+        self.assertEqual(res["result"], "SKIP")
+        self.assertIn("Baseline not established", res["summary"])
+        self.assertIn("5 more time(s)", res["summary"])
+
+    def test_warmup_reports_remaining_runs(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        baseline = core.BaselineStore(Path(d.name) / "b.db")
+        node = FakeSensorNode(**{"/joint_states": self._joint_sample(30.0)})
+        runner = self._runner(node, baseline)
+        for remaining in (5, 4, 3, 2, 1):
+            res = runner.run("baseline_health")
+            self.assertEqual(res["result"], "SKIP")
+            self.assertIn(f"{remaining} more time(s)", res["summary"])
+        res = runner.run("baseline_health")
+        self.assertIn(res["result"], ("PASS", "WARN", "FAIL"), res["summary"])
+
+    def test_stable_passes(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        baseline = core.BaselineStore(Path(d.name) / "b.db")
+        for _ in range(6):
+            baseline.observe("joint_states.rate_hz", 30.0)
+        node = FakeSensorNode(**{"/joint_states": self._joint_sample(30.0)})
+        res = self._runner(node, baseline).run("baseline_health")
+        self.assertEqual(res["result"], "PASS")
+
+    def test_drift_fails(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        baseline = core.BaselineStore(Path(d.name) / "b.db")
+        for _ in range(6):
+            baseline.observe("joint_states.rate_hz", 30.0)
+        node = FakeSensorNode(**{"/joint_states": self._joint_sample(90.0)})
+        res = self._runner(node, baseline).run("baseline_health")
+        self.assertEqual(res["result"], "FAIL")
+        self.assertIn("joint_states.rate_hz", res["summary"])
+
+
+class TestOdometryVsImu(unittest.TestCase):
+    @staticmethod
+    def _odom(roll_deg: float = 0.0, ang_z: float = 0.0) -> dict:
+        import math
+        r = math.radians(roll_deg) / 2.0
+        qx, qw = math.sin(r), math.cos(r)
+        return {"ok": True, "samples": 10, "last": {
+            "pose": {"pose": {"orientation": {"x": qx, "y": 0.0, "z": 0.0, "w": qw}}},
+            "twist": {"twist": {"angular": {"z": ang_z}}},
+        }}
+
+    @staticmethod
+    def _imu(roll_deg: float = 0.0, gyro_z: float = 0.0) -> dict:
+        import math
+        r = math.radians(roll_deg) / 2.0
+        qx, qw = math.sin(r), math.cos(r)
+        return {"ok": True, "samples": 10, "last": {
+            "orientation": {"x": qx, "y": 0.0, "z": 0.0, "w": qw},
+            "angular_velocity": {"z": gyro_z},
+        }}
+
+    def _runner(self, node) -> core.TestRunner:
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        return core.TestRunner(node, core.HistoryStore(Path(d.name) / "h.db"))
+
+    def test_agreement_passes(self):
+        node = FakeSensorNode(**{"/odom": self._odom(), "/imu/data": self._imu()})
+        self.assertEqual(self._runner(node).run("odometry_vs_imu")["result"], "PASS")
+
+    def test_roll_mismatch_warns(self):
+        node = FakeSensorNode(**{"/odom": self._odom(0.0), "/imu/data": self._imu(10.0)})
+        self.assertEqual(self._runner(node).run("odometry_vs_imu")["result"], "WARN")
+
+    def test_roll_mismatch_fails(self):
+        node = FakeSensorNode(**{"/odom": self._odom(0.0), "/imu/data": self._imu(20.0)})
+        self.assertEqual(self._runner(node).run("odometry_vs_imu")["result"], "FAIL")
+
+    def test_missing_stream_skips_in_generic_mode(self):
+        node = FakeSensorNode(**{"/odom": {"ok": False, "error": "no samples"}})
+        self.assertEqual(self._runner(node).run("odometry_vs_imu")["result"], "SKIP")
+
+    def test_missing_stream_fails_when_declared(self):
+        import robodiag_rdcd as rdcd
+        caps = {
+            "odometry": rdcd.Capability("odometry", "/odom", "nav_msgs/msg/Odometry"),
+            "imu": rdcd.Capability("imu", "/imu/data", "sensor_msgs/msg/Imu"),
+        }
+        rdcd_obj = rdcd.Rdcd("r", "R", caps)
+        node = FakeSensorNode(**{"/odom": {"ok": False, "error": "no samples"}})
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        runner = core.TestRunner(
+            node, core.HistoryStore(Path(d.name) / "h.db"), rdcd=rdcd_obj
+        )
+        self.assertEqual(runner.run("odometry_vs_imu")["result"], "FAIL")
+
+
+class TestCmdVelVsMotion(unittest.TestCase):
+    def _runner(self, node) -> core.TestRunner:
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        return core.TestRunner(node, core.HistoryStore(Path(d.name) / "h.db"))
+
+    def _run(self, cmd_peak: float, odom_peak: float) -> dict:
+        node = FakeSensorNode(**{
+            "/cmd_vel": _cmd_sample(cmd_peak),
+            "/odom": _odom_motion_sample(odom_peak),
+        })
+        return self._runner(node).run("cmd_vel_vs_motion")
+
+    def test_at_rest_passes(self):
+        self.assertEqual(self._run(0.0, 0.0)["result"], "PASS")
+
+    def test_command_without_motion_fails(self):
+        self.assertEqual(self._run(0.5, 0.0)["result"], "FAIL")
+
+    def test_under_response_warns(self):
+        self.assertEqual(self._run(0.5, 0.05)["result"], "WARN")
+
+    def test_matched_response_passes(self):
+        self.assertEqual(self._run(0.5, 0.45)["result"], "PASS")
+
+
+class TestPluginTests(unittest.TestCase):
+    def test_register_and_run(self):
+        def my_test(runner):
+            return "PASS", "plugin ran", [{"source": "plugin", "metric": "x", "value": 1}]
+
+        core.register_test("my_plugin_test", "My plugin", "desc", my_test)
+        self.addCleanup(core.TEST_CATALOG.pop, "my_plugin_test", None)
+        self.addCleanup(core._PLUGIN_TEST_FNS.pop, "my_plugin_test", None)
+        with tempfile.TemporaryDirectory() as d:
+            runner = core.TestRunner(FakeSensorNode(), core.HistoryStore(Path(d) / "h.db"))
+            res = runner.run("my_plugin_test")
+        self.assertEqual(res["result"], "PASS")
+        self.assertEqual(res["summary"], "plugin ran")
+
+    def test_plugin_multi_require_not_supported(self):
+        import robodiag_rdcd as rdcd
+
+        def my_test(runner):
+            return "PASS", "ok", []
+
+        core.register_test("multi_req_test", "Multi", "desc", my_test, requires=["odometry", "imu"])
+        self.addCleanup(core.TEST_CATALOG.pop, "multi_req_test", None)
+        self.addCleanup(core._PLUGIN_TEST_FNS.pop, "multi_req_test", None)
+        partial = rdcd.Rdcd(
+            "r", "R",
+            {"odometry": rdcd.Capability("odometry", "/odom", "nav_msgs/msg/Odometry")},
+        )
+        with tempfile.TemporaryDirectory() as d:
+            runner = core.TestRunner(
+                FakeSensorNode(), core.HistoryStore(Path(d) / "h.db"), rdcd=partial
+            )
+            res = runner.run("multi_req_test")
+        self.assertEqual(res["result"], "NOT_SUPPORTED")
+        self.assertIn("imu", res["summary"])
+
+    def test_load_entry_point_tests(self):
+        class _EP:
+            name = "fake_test"
+
+            def load(self):
+                def fn(runner):
+                    return "PASS", "from entry point", []
+                fn.name = "Fake"
+                fn.description = "d"
+                return fn
+
+        with mock.patch("importlib.metadata.entry_points", return_value=[_EP()]):
+            loaded = core.load_entry_point_tests()
+        self.assertEqual(loaded, ["fake_test"])
+        self.assertIn("fake_test", core.TEST_CATALOG)
+        self.addCleanup(core.TEST_CATALOG.pop, "fake_test", None)
+        self.addCleanup(core._PLUGIN_TEST_FNS.pop, "fake_test", None)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

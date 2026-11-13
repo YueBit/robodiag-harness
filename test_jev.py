@@ -8,8 +8,8 @@ Usage:
     python3 test_jev.py
 
 API key resolution:
-    1. TYPESAFE_API_KEY environment variable
-    2. TYPESAFE_API_KEY in ~/.robodiag.env
+    1. JEV_API_KEY (or legacy TYPESAFE_API_KEY) environment variable
+    2. JEV_API_KEY (or legacy TYPESAFE_API_KEY) in ~/.robodiag.env
 
 Exit codes:
     0  all checks passed (or skipped because no API key was found)
@@ -66,22 +66,25 @@ SYMPTOM = "My robot shakes badly when it walks."
 
 
 def load_api_key() -> str:
-    key = os.environ.get("TYPESAFE_API_KEY", "").strip()
-    if key:
-        return key
+    for name in ("JEV_API_KEY", "TYPESAFE_API_KEY"):
+        key = os.environ.get(name, "").strip()
+        if key:
+            return key
     env_file = Path.home() / ".robodiag.env"
     if env_file.exists():
         for line in env_file.read_text(encoding="utf-8").splitlines():
             line = line.strip()
-            if line.startswith("TYPESAFE_API_KEY="):
-                return line.split("=", 1)[1].strip()
+            if "=" in line:
+                k, v = line.split("=", 1)
+                if k.strip() in ("JEV_API_KEY", "TYPESAFE_API_KEY") and v.strip():
+                    return v.strip()
     return ""
 
 
 def main() -> int:
     api_key = load_api_key()
     if not api_key:
-        print("SKIP: no TYPESAFE_API_KEY found (set it or add it to ~/.robodiag.env)")
+        print("SKIP: no JEV_API_KEY (or TYPESAFE_API_KEY) found (set it or add it to ~/.robodiag.env)")
         return 0
 
     client = JevClient(api_key=api_key)
