@@ -135,6 +135,7 @@ from robodiag_core import (
     SensorAlias,
     match_sensor_alias,
     resolve_topic,
+    topics_for_alias,
     DIAG_ERROR,
     DIAG_OK,
     DIAG_WARN,
