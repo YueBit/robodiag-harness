@@ -4,4 +4,6 @@ include README.md
 include robodiag_ros2.py
 include robodiag_jev.py
 include robodiag_core.py
+include robodiag_rdcd.py
+recursive-include rdcd *.yaml *.py
 include robodiag
