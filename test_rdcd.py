@@ -449,5 +449,38 @@ class TestSafetyGateRequiredForMotion(unittest.TestCase):
         self.assertFalse(result["allow"])
 
 
+class TestRdcdStrictValidation(unittest.TestCase):
+    DOC = (
+        "schema_version: {ver}\nrobot:\n  id: r\ncapabilities:\n  imu:\n"
+        "    topic: /imu\n    message_type: sensor_msgs/msg/Imu\n{extra}"
+    )
+
+    def _load(self, ver="0.2", extra=""):
+        data = rdcd.parse_rdcd_yaml(self.DOC.format(ver=ver, extra=extra))
+        return rdcd.Rdcd.from_dict(data)
+
+    def test_valid_document(self):
+        r = self._load(extra="    expected_rate_hz: 50\n")
+        self.assertEqual(r.get("imu").expected_rate_hz, 50.0)
+
+    def test_version_is_not_float_collapsed(self):
+        for ver in ("0.10", "0.20"):
+            with self.assertRaises(rdcd.RdcdError):
+                self._load(ver=ver)
+
+    def test_invalid_expected_rate_rejected(self):
+        for bad in ("-5", "0", "nan", "inf", "fast", "true"):
+            with self.subTest(bad=bad), self.assertRaises(rdcd.RdcdError):
+                self._load(extra=f"    expected_rate_hz: {bad}\n")
+
+    def test_from_dict_and_validate_agree(self):
+        data = rdcd.parse_rdcd_yaml(self.DOC.format(ver="0.2", extra="    expected_rate_hz: -1\n"))
+        errors = rdcd.validate_rdcd(data)
+        self.assertTrue(errors)
+        with self.assertRaises(rdcd.RdcdError) as ctx:
+            rdcd.Rdcd.from_dict(data)
+        self.assertIn(errors[0], str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

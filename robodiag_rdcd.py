@@ -21,6 +21,7 @@ CI without ROS 2, rich, or any network access.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -63,57 +64,22 @@ class Rdcd:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Rdcd":
-        if not isinstance(data, dict):
-            raise RdcdError("RDCD document must be a mapping")
+        errors = validate_rdcd(data)
+        if errors:
+            raise RdcdError("; ".join(errors))
 
-        version = data.get("schema_version")
-        if str(version) not in SUPPORTED_SCHEMA_VERSIONS:
-            raise RdcdError(
-                f"unsupported schema_version {version!r} "
-                f"(expected one of {SUPPORTED_SCHEMA_VERSIONS})"
-            )
-
-        robot = data.get("robot")
-        if not isinstance(robot, dict):
-            raise RdcdError("RDCD 'robot' section is missing or not a mapping")
-        robot_id = robot.get("id")
-        if not robot_id:
-            raise RdcdError("RDCD robot.id is required")
+        robot = data["robot"]
+        robot_id = robot["id"]
         name = robot.get("name") or str(robot_id)
-
-        caps_raw = data.get("capabilities")
-        if not isinstance(caps_raw, dict):
-            raise RdcdError("RDCD 'capabilities' section must be a mapping")
-
         capabilities: dict[str, Capability] = {}
-        for cap_name, spec in caps_raw.items():
-            if not isinstance(spec, dict):
-                raise RdcdError(f"capability {cap_name!r} must be a mapping")
-            topic = spec.get("topic")
-            message_type = spec.get("message_type")
-            if not topic or not message_type:
-                raise RdcdError(
-                    f"capability {cap_name!r} requires both 'topic' and 'message_type'"
-                )
-            required_for_motion = spec.get("required_for_motion", False)
-            if not isinstance(required_for_motion, bool):
-                raise RdcdError(
-                    f"capability {cap_name!r}: 'required_for_motion' must be a boolean"
-                )
-            expected_rate_hz = spec.get("expected_rate_hz")
-            if expected_rate_hz is not None:
-                try:
-                    expected_rate_hz = float(expected_rate_hz)
-                except (TypeError, ValueError):
-                    raise RdcdError(
-                        f"capability {cap_name!r}: 'expected_rate_hz' must be numeric"
-                    )
+        for cap_name, spec in data["capabilities"].items():
+            rate = spec.get("expected_rate_hz")
             capabilities[str(cap_name)] = Capability(
                 str(cap_name),
-                str(topic),
-                str(message_type),
-                required_for_motion=required_for_motion,
-                expected_rate_hz=expected_rate_hz,
+                str(spec["topic"]),
+                str(spec["message_type"]),
+                required_for_motion=spec.get("required_for_motion", False),
+                expected_rate_hz=float(rate) if rate is not None else None,
                 description=str(spec.get("description", "")),
             )
         return cls(str(robot_id), str(name), capabilities)
@@ -194,13 +160,20 @@ def parse_rdcd_yaml(text: str) -> dict[str, Any]:
         parent = stack[-1][0]
 
         if value:
-            parent[key] = _scalar(value)
+            # Keep the version verbatim: "0.10" must not collapse to float 0.1.
+            parent[key] = value if key == "schema_version" else _scalar(value)
         else:
             child: dict[str, Any] = {}
             parent[key] = child
             stack.append((child, indent))
 
     return root
+
+
+def _is_positive_finite(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value) and value > 0
 
 
 def validate_rdcd(data: dict[str, Any]) -> list[str]:
@@ -241,7 +214,12 @@ def validate_rdcd(data: dict[str, Any]) -> list[str]:
                 errors.append(f"capability {name!r} requires 'message_type'")
             rfm = spec.get("required_for_motion")
             if rfm is not None and not isinstance(rfm, bool):
-                errors.append(f"capability {name!r}: 'required_for_motion' must be boolean")
+                errors.append(f"capability {name!r}: 'required_for_motion' must be a boolean")
+            rate = spec.get("expected_rate_hz")
+            if rate is not None and not _is_positive_finite(rate):
+                errors.append(
+                    f"capability {name!r}: 'expected_rate_hz' must be a positive finite number"
+                )
     return errors
 
 
