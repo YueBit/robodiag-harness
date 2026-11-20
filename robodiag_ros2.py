@@ -110,6 +110,7 @@ from robodiag_jev import (
     JEV_ACTIONS,
     LANGUAGE_NAMES,
     QUERY_CAPABILITIES,
+    refine_query_capability,
     DiagnosticState,
     Evidence,
     JevClient,
@@ -131,6 +132,9 @@ from robodiag_jev import (
 )
 
 from robodiag_core import (
+    SensorAlias,
+    match_sensor_alias,
+    resolve_topic,
     DIAG_ERROR,
     DIAG_OK,
     DIAG_WARN,
@@ -1907,14 +1911,6 @@ def run_jev_diagnosis(
 # text. These paths deliberately never call run_jev_diagnosis() or the LLM
 # explainer, so a simple question stays cheap and fast.
 # ──────────────────────────────────────────────────────────────────────────────
-_TOPIC_RE = re.compile(r"/(?:[A-Za-z0-9_]+/)*[A-Za-z0-9_]+")
-
-
-def _extract_topic(text: str, default: str | None = None) -> str | None:
-    match = _TOPIC_RE.search(text)
-    return match.group(0) if match else default
-
-
 _LANG: dict[str, dict[str, str]] = {
     "en": {
         "battery_full": "Battery: {pct} ({v} V)",
@@ -1930,6 +1926,8 @@ _LANG: dict[str, dict[str, str]] = {
         "nodes_header": "{n} node(s):",
         "no_nodes": "No nodes discovered.",
         "topics_header": "{n} topic(s):",
+        "topics_filtered_header": "{n} topic(s) related to {kw}:",
+        "no_topics_match": "No topics related to {kw} were found.",
         "no_topics": "No topics discovered.",
         "services_header": "{n} service(s):",
         "no_services": "No services discovered.",
@@ -1967,6 +1965,8 @@ _LANG: dict[str, dict[str, str]] = {
         "nodes_header": "{n} 个节点：",
         "no_nodes": "未发现节点。",
         "topics_header": "{n} 个话题：",
+        "topics_filtered_header": "{n} 个与 {kw} 相关的话题：",
+        "no_topics_match": "没有找到与 {kw} 相关的话题。",
         "no_topics": "未发现话题。",
         "services_header": "{n} 个服务：",
         "no_services": "未发现服务。",
@@ -2063,13 +2063,22 @@ def _fmt_nodes(g: dict[str, Any], lang: str = "en") -> str:
     return out
 
 
-def _fmt_topics(g: dict[str, Any], lang: str = "en") -> str:
+def _fmt_topics(
+    g: dict[str, Any], lang: str = "en", alias: SensorAlias | None = None, rdcd: Any = None
+) -> str:
     rows = g.get("topics", [])
     if not rows:
         return _t(lang, "no_topics")
-    out = _t(lang, "topics_header", n=len(rows))
+    if alias is not None:
+        rows = topics_for_alias(alias, rows, rdcd)
+        if not rows:
+            return _t(lang, "no_topics_match", kw=alias.label)
+        out = _t(lang, "topics_filtered_header", n=len(rows), kw=alias.label)
+    else:
+        out = _t(lang, "topics_header", n=len(rows))
     for t in rows[:25]:
-        out += f"\n- {t['name']} [{', '.join(t.get('types', []))}]"
+        # Escape: rich would otherwise swallow "[sensor_msgs/msg/Imu]" as markup.
+        out += f"\n- {t['name']} \\[{', '.join(t.get('types', []))}]"
     if len(rows) > 25:
         out += f"\n- {_t(lang, 'more', n=len(rows) - 25)}"
     return out
@@ -2154,19 +2163,29 @@ def handle_query(
     history_store: HistoryStore,
     gate: SafetyGate,
     lang: str = "en",
+    runner: TestRunner | None = None,
 ) -> bool:
     """Handle a QUERY route with one minimal deterministic tool call.
 
     Returns True when handled; False when the caller should fall back (for
     example, an unknown capability string).
     """
-    capability = route.capability
+    capability = refine_query_capability(route.capability, text)
     if capability not in QUERY_CAPABILITIES:
         return False
     spec = QUERY_CAPABILITIES[capability]
     tool = spec.tool
 
-    if tool == "battery_state":
+    if tool == "run_system_health":
+        if runner is None:
+            return False
+        with console.status("[bold #00E5FF]Running system_health…[/bold #00E5FF]"):
+            result = runner.run("system_health")
+        if result.get("error"):
+            console.print(f"[red]{result['error']}[/red]")
+        else:
+            print_test(result)
+    elif tool == "battery_state":
         console.print(_fmt_battery(node.battery_state(), lang))
     elif tool == "get_diagnostics":
         console.print(_fmt_diagnostics(node.get_diagnostics(include_ok=False), lang))
@@ -2175,7 +2194,7 @@ def handle_query(
         if capability == "nodes":
             console.print(_fmt_nodes(g, lang))
         elif capability == "topics":
-            console.print(_fmt_topics(g, lang))
+            console.print(_fmt_topics(g, lang, match_sensor_alias(text), getattr(gate, "rdcd", None)))
         elif capability == "services":
             console.print(_fmt_services(g, lang))
         else:
@@ -2190,7 +2209,7 @@ def handle_query(
                 s = node.sample_topic("/joint_states", duration_s=2.0, rate_hz=50.0)
             console.print(_fmt_joint_state_rate(s, lang))
         else:  # topic_statistics
-            topic = _extract_topic(text)
+            topic = resolve_topic(text, node, getattr(gate, "rdcd", None))
             if not topic:
                 console.print(f"[yellow]{_t(lang, 'prompt_which_topic')}[/yellow]")
                 return True
@@ -2198,7 +2217,7 @@ def handle_query(
                 s = node.sample_topic(topic)
             print_sample(s)
     elif tool == "topic_snapshot":
-        topic = _extract_topic(text)
+        topic = resolve_topic(text, node, getattr(gate, "rdcd", None))
         if not topic:
             console.print(f"[yellow]{_t(lang, 'prompt_which_topic')}[/yellow]")
             return True
@@ -3010,7 +3029,7 @@ def repl(
                     continue
 
                 if route.mode is RequestMode.QUERY:
-                    if handle_query(route, line, node, history_store, gate, lang=lang):
+                    if handle_query(route, line, node, history_store, gate, lang=lang, runner=runner):
                         continue
                     console.print("[yellow]Query capability unresolved; falling back to diagnosis.[/yellow]")
                     route = RequestRoute(mode=RequestMode.DIAGNOSIS)

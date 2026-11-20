@@ -618,6 +618,78 @@ class TestBaselineLearning(unittest.TestCase):
                          ["bot_a:joint_states.rate_hz"])
 
 
+class TestTopicResolution(unittest.TestCase):
+    GRAPH = {"topics": [
+        {"name": "/imu/data", "types": ["sensor_msgs/msg/Imu"]},
+        {"name": "/odom", "types": ["nav_msgs/msg/Odometry"]},
+        {"name": "/odom/raw", "types": ["nav_msgs/msg/Odometry"]},
+        {"name": "/tf", "types": ["tf2_msgs/msg/TFMessage"]},
+    ]}
+
+    class _Node:
+        def __init__(self, graph):
+            self._g = graph
+
+        def inspect_graph(self):
+            return self._g
+
+    def setUp(self):
+        self.node = self._Node(self.GRAPH)
+
+    def test_explicit_path_wins(self):
+        self.assertEqual(core.resolve_topic("看看 /odom/raw", self.node), "/odom/raw")
+
+    def test_sensor_name_resolves_topic(self):
+        for q in ("IMU的实时数据怎么样", "imu data please", "惯性数据"):
+            self.assertEqual(core.resolve_topic(q, self.node), "/imu/data", q)
+        self.assertEqual(core.resolve_topic("里程计数据", self.node), "/odom")
+
+    def test_unknown_question_has_no_topic(self):
+        self.assertIsNone(core.resolve_topic("一共有多少话题", self.node))
+        self.assertIsNone(core.resolve_topic("电池话题", self.node))  # no battery topic
+
+    def test_rdcd_declared_topic_preferred(self):
+        from robodiag_rdcd import Rdcd
+        r = Rdcd.from_dict({
+            "schema_version": "0.2", "robot": {"id": "r"},
+            "capabilities": {"imu": {"topic": "/my/imu", "message_type": "sensor_msgs/msg/Imu"}},
+        })
+        self.assertEqual(core.resolve_topic("imu", self.node, r), "/my/imu")
+
+    def test_topics_for_alias_filters_by_type_or_name(self):
+        alias = core.match_sensor_alias("imu的话题是什么")
+        names = [t["name"] for t in core.topics_for_alias(alias, self.GRAPH["topics"])]
+        self.assertEqual(names, ["/imu/data"])
+        alias = core.match_sensor_alias("里程计话题")
+        names = [t["name"] for t in core.topics_for_alias(alias, self.GRAPH["topics"])]
+        self.assertEqual(names, ["/odom", "/odom/raw"])
+
+    def test_explicit_path_does_not_trigger_alias(self):
+        self.assertIsNone(core.match_sensor_alias("show /imu/data"))
+
+
+class TestRobotHealthQuery(unittest.TestCase):
+    def test_general_health_upgrades_diagnostics(self):
+        for q in ("现在机器人健康吗", "机器人正常吗", "Is the robot healthy?", "is everything ok"):
+            with self.subTest(q=q):
+                self.assertEqual(jev.refine_query_capability("diagnostics", q), "robot_health")
+                self.assertEqual(jev.refine_query_capability(None, q), "robot_health")
+
+    def test_specific_diagnostics_question_unchanged(self):
+        for q in ("有没有报错", "any errors or warnings?", "诊断健康吗"):
+            with self.subTest(q=q):
+                self.assertEqual(jev.refine_query_capability("diagnostics", q), "diagnostics")
+
+    def test_other_capabilities_untouched(self):
+        self.assertEqual(jev.refine_query_capability("battery_level", "电池健康吗"), "battery_level")
+        self.assertIsNone(jev.refine_query_capability(None, "一共有多少话题"))
+
+    def test_robot_health_registered(self):
+        cap = jev.QUERY_CAPABILITIES["robot_health"]
+        self.assertEqual(cap.tool, "run_system_health")
+        self.assertIn("system_health", core.TEST_CATALOG)
+
+
 class TestOdometryVsImu(unittest.TestCase):
     @staticmethod
     def _odom(roll_deg: float = 0.0, ang_z: float = 0.0) -> dict:

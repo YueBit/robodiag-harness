@@ -25,6 +25,7 @@ See https://docs.typesafe.ai/api
 from __future__ import annotations
 
 import json
+import re
 import socket
 import time
 import urllib.error
@@ -517,9 +518,15 @@ QUERY_CAPABILITIES: dict[str, QueryCapability] = {
         "Battery voltage in volts.",
         "battery_state",
     ),
+    "robot_health": QueryCapability(
+        "robot_health",
+        "Overall robot health ('is the robot healthy?', 'is everything OK?'): runs the "
+        "composite system_health check (diagnostics, joint states, IMU, odometry, controllers, freshness).",
+        "run_system_health",
+    ),
     "diagnostics": QueryCapability(
         "diagnostics",
-        "Standard ROS /diagnostics statuses: errors, warnings and messages.",
+        "Only the raw ROS /diagnostics statuses when explicitly asked for errors, warnings or diagnostic messages.",
         "get_diagnostics",
     ),
     "ros_graph": QueryCapability(
@@ -578,6 +585,28 @@ QUERY_CAPABILITIES: dict[str, QueryCapability] = {
         "check_motion_safety",
     ),
 }
+
+_GENERAL_HEALTH_RE = re.compile(
+    r"健康|是否正常|正常吗|一切(都)?(好|正常)|没问题吗|\bhealth\w*|\bis (everything|it|the robot) (ok|okay|fine|normal)\b",
+    re.IGNORECASE,
+)
+_SPECIFIC_DIAG_RE = re.compile(
+    r"error|warn|diagnostic|错误|警告|报错|故障|诊断",
+    re.IGNORECASE,
+)
+
+
+def refine_query_capability(capability: str | None, text: str) -> str | None:
+    """Deterministic guard: a general "is the robot healthy?" question must not be
+    answered from /diagnostics alone, even if the router picked ``diagnostics``."""
+    if (
+        capability in (None, "diagnostics")
+        and _GENERAL_HEALTH_RE.search(text)
+        and not _SPECIFIC_DIAG_RE.search(text)
+    ):
+        return "robot_health"
+    return capability
+
 
 REQUEST_MODE_INSTRUCTIONS = (
     "Classify the operator's request into exactly one mode. "

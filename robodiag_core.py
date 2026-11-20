@@ -22,7 +22,7 @@ import sqlite3
 import threading
 import time
 from array import array
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -109,6 +109,81 @@ def _quat_to_rpy(qx: float, qy: float, qz: float, qw: float) -> tuple[float, flo
 def _angle_diff_deg(a_deg: float, b_deg: float) -> float:
     """Signed shortest angular difference in degrees, wrapped to [-180, 180]."""
     return (a_deg - b_deg + 180.0) % 360.0 - 180.0
+
+
+# ── Topic resolution from natural-language questions ──
+TOPIC_RE = re.compile(r"/(?:[A-Za-z0-9_]+/)*[A-Za-z0-9_]+")
+
+
+def extract_topic(text: str, default: str | None = None) -> str | None:
+    match = TOPIC_RE.search(text)
+    return match.group(0) if match else default
+
+
+@dataclass(frozen=True)
+class SensorAlias:
+    label: str
+    pattern: re.Pattern[str]
+    capability: str       # RDCD capability name
+    msg_type: str
+    default_topic: str
+
+
+SENSOR_ALIASES: tuple[SensorAlias, ...] = (
+    SensorAlias("IMU", re.compile(r"imu|惯性|姿态|陀螺|加速度", re.I),
+                 "imu", "sensor_msgs/msg/Imu", "/imu/data"),
+    SensorAlias("odometry", re.compile(r"odom|里程", re.I),
+                 "odometry", "nav_msgs/msg/Odometry", "/odom"),
+    SensorAlias("joint_states", re.compile(r"joint|关节", re.I),
+                 "joint_states", "sensor_msgs/msg/JointState", "/joint_states"),
+    SensorAlias("battery", re.compile(r"battery|电池|电量", re.I),
+                 "battery", "sensor_msgs/msg/BatteryState", "/battery_state"),
+    SensorAlias("cmd_vel", re.compile(r"cmd_vel|速度指令|速度命令|velocity command", re.I),
+                 "velocity_command", "geometry_msgs/msg/Twist", "/cmd_vel"),
+)
+
+
+def match_sensor_alias(text: str) -> SensorAlias | None:
+    # Ignore any explicit /topic path so "/imu/data" does not widen the match.
+    plain = TOPIC_RE.sub(" ", text)
+    for alias in SENSOR_ALIASES:
+        if alias.pattern.search(plain):
+            return alias
+    return None
+
+
+def topics_for_alias(alias: SensorAlias, topics: list[dict[str, Any]], rdcd: Any = None) -> list[dict[str, Any]]:
+    """Topics belonging to a sensor: declared in the RDCD, of its message type, or named like it."""
+    declared = rdcd.get(alias.capability) if rdcd is not None else None
+    ascii_kw = alias.default_topic.strip("/").split("/")[0].lower()
+    out = []
+    for t in topics:
+        if (
+            (declared is not None and t["name"] == declared.topic)
+            or alias.msg_type in t.get("types", [])
+            or ascii_kw in t["name"].lower()
+        ):
+            out.append(t)
+    return out
+
+
+def resolve_topic(text: str, node: Any, rdcd: Any = None) -> str | None:
+    """Explicit /topic path first, otherwise infer it from a sensor name in the question."""
+    explicit = extract_topic(text)
+    if explicit:
+        return explicit
+    alias = match_sensor_alias(text)
+    if alias is None:
+        return None
+    declared = rdcd.get(alias.capability) if rdcd is not None else None
+    if declared is not None:
+        return declared.topic
+    topics = node.inspect_graph().get("topics", [])
+    names = [t["name"] for t in topics]
+    if alias.default_topic in names:
+        return alias.default_topic
+    typed = [t["name"] for t in topics if alias.msg_type in t.get("types", [])]
+    return typed[0] if typed else None
 
 
 def now_iso() -> str:
