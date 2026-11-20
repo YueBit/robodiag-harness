@@ -4,15 +4,21 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch: {}
 
 permissions:
   contents: read
 
 jobs:
+  test:
+    name: Run tests
+    uses: ./.github/workflows/test.yml
+
   build-and-publish:
     name: Build and publish to PyPI
+    needs: test
     runs-on: ubuntu-latest
+    # Publish only from version tags (no manual dispatch from arbitrary branches).
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4
 
@@ -24,7 +30,6 @@ jobs:
         run: python -m pip install --upgrade pip build twine
 
       - name: Verify tag matches package version
-        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           tag_ver="${GITHUB_REF_NAME#v}"
           pkg_ver="$(sed -n 's/^VERSION = "\([^"]*\)".*/\1/p' robodiag_ros2.py | head -1)"
