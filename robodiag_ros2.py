@@ -2309,7 +2309,7 @@ HELP = f"""[bold]RoboDiag ROS 2 Harness v{VERSION}[/bold]
   /tests                         Test catalog
   /run <test_id>                 Run a deterministic test (all read-only in v0.2)
   /history \[n]                  Recent n test runs
-  /baseline                      Show rolling drift baseline (baseline_health)
+  /baseline [reset]              Show (or clear) the rolling drift baseline
   /safety                        Show the motion Safety Gate
   /timeline \[n]                 Recent /rosout log timeline (time-aligned)
   /stop                          Software stop: zero cmd_vel + optional Trigger service
@@ -2900,6 +2900,12 @@ def repl(
                 result = gate.check_for_motion()
                 console.print_json(json.dumps(result, ensure_ascii=False, default=str))
                 _note_repl_activity(repl_activity, f"/safety → allow={result.get('allow')}")
+                continue
+            if line == "/baseline reset":
+                if runner.baseline is not None:
+                    runner.baseline.clear()
+                console.print("[green]Baseline cleared.[/green]")
+                _note_repl_activity(repl_activity, "/baseline reset → cleared")
                 continue
             if line == "/baseline":
                 print_baseline(runner.baseline)

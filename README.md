@@ -210,7 +210,7 @@ Capabilities the RDCD doesn't declare are simply "not supported" for that robot.
 /tests                         Test catalog
 /run <test_id>                 Run a deterministic health test
 /history [n]                   Recent test runs
-/baseline                      Show rolling drift baseline (baseline_health)
+/baseline [reset]              Show (or clear) the rolling drift baseline
 /safety                        Show the motion Safety Gate
 /timeline [n]                  Recent /rosout log timeline (time-aligned)
 /stop                          Request a software stop

@@ -493,12 +493,14 @@ class TestBaselineStore(unittest.TestCase):
         drifted = b.compare("joint_states.rate_hz", 45.0)
         self.assertGreater(drifted["sigma"], 10.0)
 
-    def test_zero_variance_deviation_is_huge(self):
+    def test_zero_variance_uses_std_floor(self):
         b = self._store()
         for _ in range(5):
             b.observe("m", 30.0)
         self.assertEqual(b.compare("m", 30.0)["sigma"], 0.0)
-        self.assertGreater(b.compare("m", 31.0)["sigma"], 1e6)
+        # Tiny jitter stays below the WARN threshold; a real jump is still huge.
+        self.assertLess(b.compare("m", 30.05)["sigma"], core.BASELINE_WARN_SIGMA)
+        self.assertGreater(b.compare("m", 90.0)["sigma"], core.BASELINE_FAIL_SIGMA)
 
     def test_stats_and_clear(self):
         b = self._store()
@@ -562,7 +564,7 @@ class TestBaselineHealth(unittest.TestCase):
         self.addCleanup(d.cleanup)
         baseline = core.BaselineStore(Path(d.name) / "b.db")
         for _ in range(6):
-            baseline.observe("joint_states.rate_hz", 30.0)
+            baseline.observe("generic:joint_states.rate_hz", 30.0)
         node = FakeSensorNode(**{"/joint_states": self._joint_sample(30.0)})
         res = self._runner(node, baseline).run("baseline_health")
         self.assertEqual(res["result"], "PASS")
@@ -572,11 +574,48 @@ class TestBaselineHealth(unittest.TestCase):
         self.addCleanup(d.cleanup)
         baseline = core.BaselineStore(Path(d.name) / "b.db")
         for _ in range(6):
-            baseline.observe("joint_states.rate_hz", 30.0)
+            baseline.observe("generic:joint_states.rate_hz", 30.0)
         node = FakeSensorNode(**{"/joint_states": self._joint_sample(90.0)})
         res = self._runner(node, baseline).run("baseline_health")
         self.assertEqual(res["result"], "FAIL")
         self.assertIn("joint_states.rate_hz", res["summary"])
+
+
+class TestBaselineLearning(unittest.TestCase):
+    def _setup(self, rate, rdcd=None):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        baseline = core.BaselineStore(Path(d.name) / "b.db")
+        node = FakeSensorNode(**{"/joint_states": {
+            "ok": True, "samples": 10, "effective_rate_hz": rate,
+            "last": {"_joints": {"a": {"position": 0.0}}}}})
+        runner = core.TestRunner(
+            node, core.HistoryStore(Path(d.name) / "h.db"), baseline=baseline, rdcd=rdcd
+        )
+        return baseline, runner
+
+    def test_drifted_value_is_not_learned(self):
+        baseline, runner = self._setup(90.0)
+        for _ in range(6):
+            baseline.observe("generic:joint_states.rate_hz", 30.0)
+        for _ in range(3):
+            self.assertEqual(runner.run("baseline_health")["result"], "FAIL")
+        row = baseline.stats()[0]
+        self.assertEqual(row["n"], 6)
+        self.assertAlmostEqual(row["mean"], 30.0)
+
+    def test_baseline_is_scoped_per_robot(self):
+        from robodiag_rdcd import Rdcd
+        rdcd = Rdcd.from_dict({
+            "schema_version": "0.2", "robot": {"id": "bot_a"},
+            "capabilities": {"joint_states": {
+                "topic": "/joint_states",
+                "message_type": "sensor_msgs/msg/JointState"}},
+        })
+        baseline, runner = self._setup(30.0, rdcd=rdcd)
+        runner.run("baseline_health")
+        self.assertEqual([r["metric"] for r in baseline.stats()],
+                         ["bot_a:joint_states.rate_hz"])
 
 
 class TestOdometryVsImu(unittest.TestCase):

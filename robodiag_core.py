@@ -62,6 +62,10 @@ CMD_VS_MOTION_RESPONSE_RATIO = 0.30    # observed/commanded below this → slip/
 BASELINE_MIN_SAMPLES = 5
 BASELINE_WARN_SIGMA = 3.0
 BASELINE_FAIL_SIGMA = 5.0
+# Floor on the std used for z-scores, so a metric that was perfectly (or nearly)
+# constant during warm-up does not turn tiny jitter into a huge sigma.
+BASELINE_MIN_STD_REL = 0.01   # fraction of |mean|
+BASELINE_MIN_STD_ABS = 1e-3
 
 
 def _finite(value: Any) -> float | None:
@@ -455,8 +459,9 @@ class BaselineStore:
         """Compare a value against the baseline without updating it.
 
         Returns ``{metric, value, n, mean, std, sigma}`` where ``sigma`` is the
-        absolute z-score (standard deviations from the mean) and is None until
-        at least two observations exist.
+        absolute z-score (standard deviations from the mean, using a floored
+        std; see ``BASELINE_MIN_STD_*``) and is None until at least two
+        observations exist.
         """
         v = _finite(value)
         if v is None:
@@ -476,12 +481,8 @@ class BaselineStore:
         if n < 2:
             return {"metric": metric, "value": round(v, 6), "n": n, "mean": round(mean, 6), "std": None, "sigma": None}
         std = math.sqrt(m2 / (n - 1))
-        if std == 0.0:
-            # Zero historical variance: any deviation is a huge (effectively
-            # infinite) drift, but keep it finite so it stays JSON-safe.
-            sigma = 0.0 if abs(v - mean) < 1e-12 else 1e9
-        else:
-            sigma = abs(v - mean) / std
+        effective_std = max(std, BASELINE_MIN_STD_REL * abs(mean), BASELINE_MIN_STD_ABS)
+        sigma = abs(v - mean) / effective_std
         return {
             "metric": metric,
             "value": round(v, 6),
@@ -1156,9 +1157,16 @@ class TestRunner:
         if not metrics:
             return "SKIP", "No baselinable metrics could be measured.", evidence
 
+        # Baselines are per robot so different RDCDs never share statistics.
+        scope = self.rdcd.robot_id if self.rdcd is not None else "generic"
+        metrics = [(f"{scope}:{m}", v) for m, v in metrics]
+
         comparisons = [self.baseline.compare(m, v) for m, v in metrics]
-        for m, v in metrics:
-            self.baseline.observe(m, v)
+        # Learn only from values that are not drifting; otherwise a persistent
+        # fault would gradually become the "normal" baseline.
+        for (m, v), c in zip(metrics, comparisons):
+            if c["sigma"] is None or c["sigma"] <= BASELINE_WARN_SIGMA:
+                self.baseline.observe(m, v)
         evidence.extend(
             asdict(Evidence("baseline", c["metric"], c, now_iso())) for c in comparisons
         )
