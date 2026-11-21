@@ -218,6 +218,7 @@ Capabilities the RDCD doesn't declare are simply "not supported" for that robot.
 /rdcd-guess [robot-id]         Guess an RDCD from the live ROS graph
 /verify                        Continue the last diagnosis with more read-only checks
 /jev                           Show Jev routing status
+/version                       Show version, source file and git commit in use
 /help                          Help
 /quit                          Quit
 ```

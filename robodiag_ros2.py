@@ -99,6 +99,7 @@ import json
 import math
 import os
 import re
+import traceback
 import sys
 import threading
 import time
@@ -236,6 +237,7 @@ except ImportError as exc:
 try:
     from rich.console import Console
     from rich.live import Live
+    from rich.markup import escape
     from rich.markdown import Markdown
     from rich.panel import Panel
     from rich.table import Table
@@ -250,7 +252,7 @@ except ImportError:
     OpenAI = None  # AI remains optional
 
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 # Set ROBODIAG_VERBOSE=1 to see per-decision routing probabilities and other
 # diagnostic traces. The default keeps the agent output focused on results.
@@ -2318,27 +2320,40 @@ def handle_chat(
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI rendering
 # ──────────────────────────────────────────────────────────────────────────────
+_HELP_COMMANDS: list[tuple[str, str]] = [
+    ("/graph", "ROS graph summary"),
+    ("/diagnostics", "Standard /diagnostics status"),
+    ("/control", "ros2_control status"),
+    ("/check", "Composite read-only health check"),
+    ("/topic <topic>", "Snapshot one message from a topic"),
+    ("/sample <topic> [sec] [Hz]", "Sample a topic over time and compute statistics"),
+    ("/tests", "Test catalog"),
+    ("/run <test_id>", "Run a deterministic test (all read-only in v0.2)"),
+    ("/history [n]", "Recent n test runs"),
+    ("/baseline [reset]", "Show (or clear) the rolling drift baseline"),
+    ("/safety", "Show the motion Safety Gate"),
+    ("/timeline [n]", "Recent /rosout log timeline (time-aligned)"),
+    ("/stop", "Software stop: zero cmd_vel + optional Trigger service"),
+    ("/rdcd [robot|path|off]", "Show or switch the active RDCD"),
+    ("/rdcd-guess [robot-id]", "Guess an RDCD from the live ROS graph"),
+    ("/verify", "Continue the last diagnosis with more read-only checks"),
+    ("/jev", "Show Jev (System 1) routing status"),
+    ("/version", "Show version, source file and git commit in use"),
+    ("/help", "Help"),
+    ("/quit", "Quit"),
+]
+
+
+def _format_help_commands() -> str:
+    # Pad on the plain text and escape afterwards, so "[n]" renders literally
+    # and every description starts in the same column.
+    width = max(len(cmd) for cmd, _ in _HELP_COMMANDS) + 2
+    return "\n".join(f"  {escape(cmd)}{' ' * (width - len(cmd))}{desc}" for cmd, desc in _HELP_COMMANDS)
+
+
 HELP = f"""[bold]RoboDiag ROS 2 Harness v{VERSION}[/bold]
 
-  /graph                         ROS graph summary
-  /diagnostics                   Standard /diagnostics status
-  /control                       ros2_control status
-  /check                         Composite read-only health check
-  /topic <topic>                 Snapshot one message from a topic
-  /sample <topic> \[sec] \[Hz]   Sample a topic over time and compute statistics
-  /tests                         Test catalog
-  /run <test_id>                 Run a deterministic test (all read-only in v0.2)
-  /history \[n]                  Recent n test runs
-  /baseline [reset]              Show (or clear) the rolling drift baseline
-  /safety                        Show the motion Safety Gate
-  /timeline \[n]                 Recent /rosout log timeline (time-aligned)
-  /stop                          Software stop: zero cmd_vel + optional Trigger service
-  /rdcd [robot|path|off]        Show or switch the active RDCD
-  /rdcd-guess [robot-id]        Guess an RDCD from the live ROS graph
-  /verify                        Continue the last diagnosis with more read-only checks
-  /jev                           Show Jev (System 1) routing status
-  /help                          Help
-  /quit                          Quit
+{_format_help_commands()}
 
 Any other input is routed by Jev (System 1) first:
   QUERY     → one deterministic lookup → concise answer
@@ -2358,6 +2373,7 @@ REPL_COMMANDS: list[tuple[str, str]] = [
     ("/diagnostics", "Standard /diagnostics status"),
     ("/control", "ros2_control status"),
     ("/check", "Composite read-only health check"),
+    ("/version", "Show version, source file and git commit in use"),
     ("/topic", "Snapshot one message from a topic"),
     ("/sample", "Sample a topic over a time window"),
     ("/tests", "Test catalog"),
@@ -2629,6 +2645,26 @@ def confirm_stop() -> bool:
     return True
 
 
+def version_info() -> str:
+    """Version, the source file actually loaded, and the git commit if available."""
+    here = Path(__file__).resolve().parent
+    commit = "unknown (not a git checkout)"
+    try:
+        head = (here / ".git" / "HEAD").read_text().strip()
+        if head.startswith("ref: "):
+            ref = head[5:]
+            ref_file = here / ".git" / ref
+            if ref_file.exists():
+                head = ref_file.read_text().strip()
+            else:
+                packed = (here / ".git" / "packed-refs").read_text().splitlines()
+                head = next((ln.split()[0] for ln in packed if ln.endswith(" " + ref)), head)
+        commit = head[:7]
+    except OSError:
+        pass
+    return f"RoboDiag {VERSION}\nsource: {Path(__file__).resolve()}\ncommit: {commit}"
+
+
 def print_baseline(baseline: Any) -> None:
     if baseline is None:
         console.print("[yellow]Baseline store is not configured.[/yellow]")
@@ -2840,6 +2876,9 @@ def repl(
                     c = node.inspect_ros2_control()
                 print_control(c)
                 _note_repl_activity(repl_activity, "/control → " + ("ros2_control reachable" if c.get("available") else "ros2_control unavailable"))
+                continue
+            if line == "/version":
+                console.print(version_info(), markup=False, highlight=False)
                 continue
             if line == "/check":
                 with console.status("[bold #00E5FF]Running composite diagnostics…[/bold #00E5FF]"):
@@ -3087,6 +3126,10 @@ def repl(
             console.print("[yellow]Current operation interrupted; if the robot is moving abnormally, type /stop.[/yellow]")
         except Exception as exc:  # noqa: BLE001
             console.print(f"[red]{type(exc).__name__}: {exc}[/red]")
+            if os.environ.get("ROBODIAG_DEBUG"):
+                console.print(traceback.format_exc(), markup=False, highlight=False)
+            else:
+                console.print("[dim]Set ROBODIAG_DEBUG=1 for a traceback, or run /version to see which code is running.[/dim]")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
