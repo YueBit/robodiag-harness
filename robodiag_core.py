@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import sqlite3
 import threading
@@ -150,6 +151,57 @@ def match_sensor_alias(text: str) -> SensorAlias | None:
         if alias.pattern.search(plain):
             return alias
     return None
+
+
+HOST_RESOURCE_RE = re.compile(
+    r"\bcpu\b|处理器|占用率|\b(memory|ram)\b|内存|\bload average\b|负载|\btemperature\b|\btemp\b|温度|发烫|\bdisk\b|磁盘|硬盘",
+    re.IGNORECASE,
+)
+
+
+def host_resources() -> dict[str, Any]:
+    """CPU / memory / temperature of the machine running the harness (Linux /proc, read-only)."""
+    out: dict[str, Any] = {"ok": True, "scope": "host running robodiag-harness"}
+    try:
+        with open("/proc/loadavg", encoding="utf-8") as f:
+            parts = f.read().split()
+        cores = os.cpu_count() or 1
+        out["cpu_cores"] = cores
+        out["load_avg"] = {"1m": float(parts[0]), "5m": float(parts[1]), "15m": float(parts[2])}
+        out["load_per_core_1m"] = round(float(parts[0]) / cores, 2)
+
+        def _cpu_times() -> tuple[int, int]:
+            with open("/proc/stat", encoding="utf-8") as f:
+                vals = [int(v) for v in f.readline().split()[1:]]
+            return sum(vals), vals[3] + (vals[4] if len(vals) > 4 else 0)
+
+        t0, i0 = _cpu_times()
+        time.sleep(0.5)
+        t1, i1 = _cpu_times()
+        if t1 > t0:
+            out["cpu_percent"] = round(100.0 * (1 - (i1 - i0) / (t1 - t0)), 1)
+    except (OSError, ValueError, IndexError) as exc:
+        out["cpu_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        info: dict[str, int] = {}
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                info[k] = int(v.split()[0])
+        total, avail = info["MemTotal"], info["MemAvailable"]
+        out["memory"] = {
+            "total_mb": round(total / 1024),
+            "available_mb": round(avail / 1024),
+            "used_percent": round(100.0 * (1 - avail / total), 1),
+        }
+    except (OSError, ValueError, KeyError) as exc:
+        out["memory_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", encoding="utf-8") as f:
+            out["temperature_c"] = round(int(f.read().strip()) / 1000.0, 1)
+    except (OSError, ValueError):
+        pass
+    return out
 
 
 def topics_for_alias(alias: SensorAlias, topics: list[dict[str, Any]], rdcd: Any = None) -> list[dict[str, Any]]:

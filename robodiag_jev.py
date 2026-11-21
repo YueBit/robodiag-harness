@@ -265,7 +265,11 @@ def validated_verification_checks(
 
 
 class JevError(RuntimeError):
-    pass
+    """Jev request failure. ``fatal`` means retrying (or keeping Jev on) is pointless."""
+
+    def __init__(self, message: str = "", *, fatal: bool = False) -> None:
+        super().__init__(message)
+        self.fatal = fatal
 
 
 class JevClient:
@@ -314,9 +318,10 @@ class JevClient:
                 except OSError:
                     pass
                 message = f"Jev HTTP {exc.code}: {detail or exc.reason}"
-                # Auth and validation errors are not transient; surface them now.
-                if exc.code in (401, 422):
-                    raise JevError(message) from exc
+                # Only rate limits, timeouts and server errors are worth retrying; any other
+                # 4xx (auth, validation, 451 region block, ...) will fail the same way again.
+                if exc.code not in (408, 429) and exc.code < 500:
+                    raise JevError(message, fatal=True) from exc
                 last_error = JevError(message)
             except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as exc:
                 last_error = JevError(f"Jev connection error: {type(exc).__name__}: {exc}")

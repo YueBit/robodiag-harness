@@ -137,6 +137,8 @@ from robodiag_core import (
     match_sensor_alias,
     resolve_topic,
     topics_for_alias,
+    HOST_RESOURCE_RE,
+    host_resources,
     DIAG_ERROR,
     DIAG_OK,
     DIAG_WARN,
@@ -246,10 +248,43 @@ except ImportError as exc:
     print("Missing Python package 'rich'. Install with: python3 -m pip install --user rich")
     raise SystemExit(2) from exc
 
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None  # AI remains optional
+import importlib.util
+import threading
+
+# AI is optional. ``import openai`` alone takes ~8 s on a Raspberry Pi, so it is only
+# probed here and the real import happens lazily (warmed up in a background thread).
+_OPENAI_AVAILABLE = importlib.util.find_spec("openai") is not None
+
+
+class _LazyOpenAI:
+    """OpenAI client proxy that defers the slow SDK import until first use."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        self._kwargs = kwargs
+        self._real: Any = None
+        self._lock = threading.Lock()
+
+    def _resolve(self) -> Any:
+        with self._lock:
+            if self._real is None:
+                from openai import OpenAI
+
+                self._real = OpenAI(**self._kwargs)
+        return self._real
+
+    def warm_up(self) -> None:
+        def _run() -> None:
+            try:
+                self._resolve()
+            except Exception:  # noqa: BLE001 - surfaces again on first real use
+                pass
+
+        threading.Thread(target=_run, name="openai-warmup", daemon=True).start()
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._resolve(), name)
 
 
 VERSION = "0.2.1"
@@ -1074,6 +1109,14 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "get_host_resources",
+            "description": "CPU usage, load average, memory and temperature of the computer running robodiag-harness (usually the robot). Use for CPU/memory/temperature questions. Read-only.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_timeline",
             "description": "Read recent /rosout log entries in arrival order (time-aligned evidence) to correlate events around a fault. Read-only.",
             "parameters": {
@@ -1099,7 +1142,8 @@ Principles:
 6. emergency_stop is a software-level fallback, not a physical E-stop; if dangerous motion is observed you may call it immediately without user confirmation.
 7. v0.2 has no diagnostic test that actively drives joints; do not claim that you made the robot perform a motion test.
 8. Before writing a conclusion, run the read-only checks that would confirm or rule out your leading hypothesis; do not hand the operator checks you could have run yourself. Only list a check as a "recommended next step" if it is genuinely unavailable to you.
-9. Answer in the same language as the operator (if the language is unclear, reply in English), organized as: verdict → confirmed findings → short assessment → suspected causes → genuinely unrun checks. Keep it engineering-focused, under about 250 words, and do not repeat the same evidence in more than one section.
+9. Match the tool to the question. CPU/memory/temperature questions -> get_host_resources. Never answer a question by running an unrelated test (e.g. system_health for a CPU question); if no tool can answer, say so plainly.
+10. Answer in the same language as the operator (if the language is unclear, reply in English), organized as: verdict → confirmed findings → short assessment → suspected causes → genuinely unrun checks. Keep it engineering-focused, under about 250 words, and do not repeat the same evidence in more than one section.
 """
 
 
@@ -1147,6 +1191,8 @@ class AgentRuntime:
                 if baseline is None:
                     return compact({"ok": False, "error": "baseline store not configured"})
                 return compact({"ok": True, "metrics": baseline.stats()})
+            if name == "get_host_resources":
+                return compact(host_resources())
             if name == "get_timeline":
                 return compact(self.node.get_timeline(int(args.get("limit", 50))))
             if name == "emergency_stop":
@@ -2267,6 +2313,30 @@ def handle_action(
     return False
 
 
+def show_host_resources(res: dict[str, Any], lang: str) -> None:
+    zh = lang == "zh"
+    lines = []
+    if "cpu_percent" in res:
+        la = res["load_avg"]
+        lines.append(
+            f"CPU {'占用' if zh else 'usage'}: {res['cpu_percent']}%  ·  "
+            f"{'负载' if zh else 'load'} {la['1m']}/{la['5m']}/{la['15m']} "
+            f"({res['cpu_cores']} {'核' if zh else 'cores'}, {res['load_per_core_1m']}/{'核' if zh else 'core'})"
+        )
+    if "memory" in res:
+        m = res["memory"]
+        lines.append(
+            f"{'内存' if zh else 'Memory'}: {m['used_percent']}%  "
+            f"({m['available_mb']} MB {'可用' if zh else 'available'} / {m['total_mb']} MB)"
+        )
+    if "temperature_c" in res:
+        lines.append(f"{'温度' if zh else 'Temperature'}: {res['temperature_c']} °C")
+    if not lines:
+        lines.append("Host resource info unavailable on this system.")
+    lines.append(f"[dim]{'来源: 运行 harness 的主机 (/proc)' if zh else 'Source: host running harness (/proc)'}[/dim]")
+    console.print("\n".join(lines))
+
+
 def handle_chat(
     llm_client: Any | None,
     model: str,
@@ -3061,11 +3131,33 @@ def repl(
 
             lang = detect_language(line)
 
+            if HOST_RESOURCE_RE.search(line):
+                show_host_resources(host_resources(), lang)
+                continue
+
             if request_router is not None:
                 try:
                     route = request_router.route(line)
                 except JevError as exc:
-                    console.print(f"[red]Jev request routing failed: {exc}[/red]")
+                    # Jev is optional: never leave the user without an answer.
+                    if exc.fatal:
+                        request_router = None
+                        jev_router = None
+                        console.print(
+                            f"[yellow]Jev is unavailable ({exc}); disabled for this session — "
+                            "using the LLM function-calling agent instead.[/yellow]"
+                        )
+                    else:
+                        console.print(f"[yellow]Jev request routing failed ({exc}); using the LLM agent for this message.[/yellow]")
+                    if llm_client is None:
+                        console.print("[red]AI Agent not configured. Set LLM_API_KEY or OPENAI_API_KEY to enable natural-language diagnosis.[/red]")
+                        continue
+                    chat_history = agent_turn(
+                        runtime,
+                        llm_client,
+                        model,
+                        _messages_with_context(chat_history, line, repl_activity),
+                    )
                     continue
 
                 if route.mode is RequestMode.QUERY:
@@ -3151,14 +3243,12 @@ def build_llm_client(
     model = model_override or _resolve_env(_LLM_MODEL_ENV, env_file, default_model)
     if not api_key or "your-api-key" in api_key:
         return None, model
-    if OpenAI is None:
+    if not _OPENAI_AVAILABLE:
         console.print("[yellow]API key detected, but the 'openai' Python package is missing. Run: pip install openai[/yellow]")
         return None, model
-    try:
-        return OpenAI(api_key=api_key, base_url=_normalize_llm_base_url(base_url)), model
-    except Exception as exc:  # noqa: BLE001
-        console.print(f"[yellow]AI Agent initialization failed; disabled: {type(exc).__name__}: {exc}[/yellow]")
-        return None, model
+    client = _LazyOpenAI(api_key=api_key, base_url=_normalize_llm_base_url(base_url))
+    client.warm_up()
+    return client, model
 
 
 def list_rdcd_ids() -> list[str]:

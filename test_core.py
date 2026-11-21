@@ -828,5 +828,44 @@ class TestPluginTests(unittest.TestCase):
         self.addCleanup(core._PLUGIN_TEST_FNS.pop, "fake_test", None)
 
 
+class TestHostResources(unittest.TestCase):
+    def test_regex_matches_cpu_questions(self):
+        for q in ("how is the CPU occupancy now", "现在CPU占用率多少", "内存还剩多少", "机器人温度"):
+            self.assertTrue(core.HOST_RESOURCE_RE.search(q), q)
+        for q in ("现在机器人健康吗", "imu的话题是什么"):
+            self.assertFalse(core.HOST_RESOURCE_RE.search(q), q)
+
+    def test_host_resources_reads_proc(self):
+        res = core.host_resources()
+        self.assertTrue(res["ok"])
+        self.assertIn("load_avg", res)
+        self.assertIn("memory", res)
+
+
+class TestJevRetryPolicy(unittest.TestCase):
+    def _http_error(self, code):
+        import io
+        import urllib.error
+        return urllib.error.HTTPError("http://x", code, "err", {}, io.BytesIO(b"{}"))
+
+    def _call(self, code):
+        client = jev.JevClient(api_key="k", base_url="http://x")
+        with mock.patch("urllib.request.urlopen", side_effect=self._http_error(code)) as m, \
+                mock.patch("time.sleep"):
+            with self.assertRaises(jev.JevError) as ctx:
+                client.system_one({}, {})
+        return m.call_count, ctx.exception
+
+    def test_region_block_is_fatal_and_not_retried(self):
+        calls, exc = self._call(451)
+        self.assertEqual(calls, 1)
+        self.assertTrue(exc.fatal)
+
+    def test_server_error_is_retried(self):
+        calls, exc = self._call(503)
+        self.assertEqual(calls, 4)
+        self.assertFalse(exc.fatal)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
