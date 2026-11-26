@@ -303,7 +303,7 @@ class _LazyOpenAI:
         return getattr(self._resolve(), name)
 
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 
 # Set ROBODIAG_VERBOSE=1 to see per-decision routing probabilities and other
 # diagnostic traces. The default keeps the agent output focused on results.

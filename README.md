@@ -24,6 +24,13 @@ Robot → Evidence → Tests → Diagnosis
 
 AI can help you decide what to look at and explain what the evidence means. But the measured data and the deterministic code stay the source of truth.
 
+## What's new in 0.3
+
+* `/report` exports Markdown/HTML reports; `/trend` flags degrading tests; `/bag` checks rosbag2 offline.
+* New `tf_health` test (frame tree + clock sync); `--profile` per-robot thresholds.
+* Stricter host-resource questions, disk/thermal info; Jev pauses on soft errors instead of staying off.
+* Config split into `robodiag_config.py`; ruff and coverage gate in CI.
+
 ## What RoboDiag does
 
 RoboDiag can look at the live ROS 2 graph, read standard `/diagnostics`, sample any topic over time, run deterministic health tests, and remember every result in SQLite.
