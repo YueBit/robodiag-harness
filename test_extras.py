@@ -205,3 +205,13 @@ def test_host_query_ignores_swap_and_storage_in_robot_context():
     assert not is_host_resource_query("check rosbag storage format")
     assert is_host_resource_query("how much disk space is left")
     assert is_host_resource_query("is swap usage high")
+
+
+def test_report_flattens_composite_evidence():
+    from robodiag_report import build_report_data, render_markdown
+
+    child = {"test_id": "imu_health", "result": "PASS", "evidence": [
+        {"source": "/imu", "metric": "rate", "value": 10, "quality": "measured"}]}
+    data = build_report_data([{"test_id": "system_health", "result": "PASS", "summary": "ok", "evidence": [child]}])
+    md = render_markdown(data)
+    assert "`/imu` · rate" in md and "`?`" not in md

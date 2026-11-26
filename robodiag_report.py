@@ -101,6 +101,17 @@ def latest_per_test(rows: list[dict[str, Any]], since: str | None = None) -> lis
     return list(latest.values())
 
 
+def _flat_evidence(evidence: list[Any]) -> list[dict[str, Any]]:
+    """Composite tests (system_health) store whole sub-results as evidence; unwrap them into plain items."""
+    out: list[dict[str, Any]] = []
+    for e in evidence or []:
+        if isinstance(e, dict) and "evidence" in e and "metric" not in e:
+            out += _flat_evidence(e["evidence"])
+        elif isinstance(e, dict):
+            out.append(e)
+    return out
+
+
 def _short(value: Any, limit: int = 300) -> str:
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -150,9 +161,10 @@ def render_markdown(data: dict[str, Any]) -> str:
         out.append(f"| {r['test_id']} | {r.get('started_at', '')} | {_BADGE.get(r['result'], '')} {r['result']} | {r.get('duration_ms', 0)} ms | {summary} |")
     ev_blocks = []
     for r in data["results"]:
-        if r.get("evidence"):
+        evidence = _flat_evidence(r.get("evidence"))
+        if evidence:
             ev_blocks.append(f"### {r['test_id']}\n")
-            for e in r["evidence"]:
+            for e in evidence:
                 ev_blocks.append(f"- `{e.get('source', '?')}` · {e.get('metric', '?')} ({e.get('quality', 'measured')}): "
                                  f"`{_short(e.get('value'))}`")
             ev_blocks.append("")
@@ -173,10 +185,10 @@ def render_html(data: dict[str, Any]) -> str:
     )
     evidence = ""
     for r in data["results"]:
-        if r.get("evidence"):
+        if _flat_evidence(r.get("evidence")):
             items = "".join(
                 f"<li><code>{esc(str(e.get('source', '?')))}</code> · {esc(str(e.get('metric', '?')))}: "
-                f"<code>{esc(_short(e.get('value')))}</code></li>" for e in r["evidence"])
+                f"<code>{esc(_short(e.get('value')))}</code></li>" for e in _flat_evidence(r.get("evidence")))
             evidence += f"<h3>{esc(r['test_id'])}</h3><ul>{items}</ul>"
     alerts = "".join(f"<li><b>{esc(a['level'])}</b> {esc(a['message'])}</li>" for a in data["alerts"])
     meta = "".join(f"<li>{esc(str(k))}: {esc(str(v))}</li>" for k, v in data["meta"].items())
