@@ -25,15 +25,14 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       # The tested modules (core, jev, rdcd) are stdlib-only; ROS 2 is not needed.
-      - name: Install pytest and pyflakes
-        run: python -m pip install --upgrade pip pytest pyflakes
+
+      - name: Install pytest, ruff and coverage
+        run: python -m pip install --upgrade pip pytest pytest-cov ruff
 
       # robodiag_ros2.py cannot be imported without ROS 2, so tests miss
-      # NameErrors there; fail the build on undefined names instead.
-      - name: Check for undefined names
-        run: |
-          python -m pyflakes *.py | tee pyflakes.out
-          ! grep -i "undefined name" pyflakes.out
+      # NameErrors there; ruff (pyflakes rules) fails the build on those and on unused imports.
+      - name: Lint
+        run: python -m ruff check .
 
-      - name: Run tests
-        run: python -m pytest -q
+      - name: Run tests with coverage gate
+        run: python -m pytest -q --cov=robodiag_core --cov=robodiag_jev --cov=robodiag_rdcd --cov=robodiag_config --cov=robodiag_report --cov=robodiag_bag --cov-report=term-missing

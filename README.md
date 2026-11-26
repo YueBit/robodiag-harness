@@ -214,6 +214,10 @@ Capabilities the RDCD doesn't declare are simply "not supported" for that robot.
 /safety                        Show the motion Safety Gate
 /timeline [n]                  Recent /rosout log timeline (time-aligned)
 /stop                          Request a software stop
+/trend                         Per-test result history and degradation alerts
+/report [md|html] [path]       Export a diagnostic report (results, evidence, diagnosis, host, alerts)
+/bag <path>                    Offline health check of a rosbag2 recording (no robot needed)
+/profile                       List threshold profiles / show the active one
 /rdcd [robot|path|off]         Show or switch the active RDCD
 /rdcd-guess [robot-id]         Guess an RDCD from the live ROS graph
 /verify                        Continue the last diagnosis with more read-only checks
@@ -257,6 +261,7 @@ Built-in tests:
 | `velocity_command_health` | Observe the velocity-command topic; flag non-finite or out-of-bounds commands |
 | `odometry_vs_imu` | Cross-check odometry pose/twist against IMU orientation/angular-rate; disagreement indicates sensor fault, calibration error or slip |
 | `cmd_vel_vs_motion` | Compare velocity commands against observed odometry twist; flags stalled/blocked or slipped motion |
+| `tf_health` | Sample `/tf` + `/tf_static`: single connected tree, no duplicate parents/cycles, no stale dynamic transforms, header stamps consistent with the clock (clock-sync check) |
 | `baseline_health` | Compare current joint-state rate and IMU attitude against the rolling baseline; flags drift beyond 3σ (WARN) / 5σ (FAIL) |
 | `declared_capability_check` | Verify every RDCD-declared capability is present with the declared message type |
 | `system_health` | Run the applicable tests and combine the result |
@@ -468,7 +473,19 @@ export OPENAI_API_KEY=sk-...
 | `ROBODIAG_MAX_DIAG_AGE_S` | `5.0` | Maximum diagnostics age |
 | `ROBODIAG_MAX_BATTERY_AGE_S` | `5.0` | Maximum battery-state age |
 | `ROBODIAG_MAX_JOINT_STATE_AGE_S` | `1.0` | Maximum joint-state age |
+| `ROBODIAG_TF_MAX_STAMP_OFFSET_S` | `0.5` | Max `/tf` header-stamp vs receive-time offset |
+| `ROBODIAG_TF_STALE_S` | `2.0` | A dynamic transform silent this long is stale |
 | `ROBODIAG_DB` | `~/.robodiag_ros2.db` | History database |
+
+### Per-robot profiles
+
+Put `ROBODIAG_*` thresholds in `~/.robodiag/profiles/<name>.env` (same `KEY=VALUE` format as `~/.robodiag.env`) and start with `robodiag --profile <name>` (or `ROBODIAG_PROFILE=<name>`). Profile values are defaults: a variable already set in the real environment wins.
+
+## Reports, trends and offline analysis
+
+* `/report [md|html] [path]` exports results, evidence, diagnosis and host info (default `~/.robodiag/reports/`).
+* `/trend` shows history alerts (repeated failures, regressions, slowdowns); also printed after `/run` and `/check`.
+* `/bag <path>` (or `python3 robodiag_bag.py <path> [--expect /topic]`) checks a rosbag2 `.db3` offline: rate, gaps, stopped or missing topics. No MCAP, no message contents.
 
 ## How it works
 
@@ -509,6 +526,9 @@ RDCD decides which capabilities apply. The ROS graph provides the actual runtime
 | `robodiag_core.py` | Test runner, history, Safety Gate, deterministic core | No |
 | `robodiag_rdcd.py` | RDCD loading, validation, capability status | No |
 | `robodiag_jev.py` | Jev routing and diagnostic state | No |
+| `robodiag_config.py` | Env / `~/.robodiag.env` resolution and threshold profiles | No |
+| `robodiag_report.py` | Report export (Markdown/HTML) and history trend alerts | No |
+| `robodiag_bag.py` | Offline rosbag2 (sqlite3) health analysis | No |
 | `robodiag` | Launcher | Shell / ROS environment |
 | `rdcd/mini_pupper_2.yaml` | First robot-specific RDCD | No |
 

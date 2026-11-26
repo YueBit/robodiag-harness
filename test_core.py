@@ -829,17 +829,40 @@ class TestPluginTests(unittest.TestCase):
 
 
 class TestHostResources(unittest.TestCase):
-    def test_regex_matches_cpu_questions(self):
-        for q in ("how is the CPU occupancy now", "现在CPU占用率多少", "内存还剩多少", "机器人温度"):
-            self.assertTrue(core.HOST_RESOURCE_RE.search(q), q)
-        for q in ("现在机器人健康吗", "imu的话题是什么"):
-            self.assertFalse(core.HOST_RESOURCE_RE.search(q), q)
+    def test_explicit_host_questions_match(self):
+        for q in ("how is the CPU occupancy now", "现在CPU占用率多少", "内存还剩多少", "磁盘还剩多少空间",
+                  "disk usage", "主机温度多少", "CPU温度", "what is the system load", "how hot is the jetson board"):
+            self.assertTrue(core.is_host_resource_query(q), q)
+
+    def test_robot_questions_are_not_hijacked(self):
+        for q in ("motor temperature", "imu temp topic", "检查机械臂负载", "现在机器人健康吗", "imu的话题是什么",
+                  "电机温度正常吗", "what is the payload", "check joint load", "battery temperature",
+                  "/imu/data temperature", "温度传感器话题"):
+            self.assertFalse(core.is_host_resource_query(q), q)
 
     def test_host_resources_reads_proc(self):
         res = core.host_resources()
         self.assertTrue(res["ok"])
         self.assertIn("load_avg", res)
         self.assertIn("memory", res)
+        self.assertTrue(res["disk"] and res["disk"][0]["path"] == "/")
+
+    def test_all_thermal_zones_are_read(self):
+        class _Zone:
+            def __init__(self, name, kind, raw):
+                self.name, self._kind, self._raw = name, kind, raw
+
+            def __lt__(self, other):
+                return self.name < other.name
+
+            def __truediv__(self, item):
+                text = self._kind if item == "type" else self._raw
+                return mock.Mock(read_text=lambda encoding=None: text)
+
+        zones = [_Zone("thermal_zone0", "cpu-thermal", "45000\n"), _Zone("thermal_zone1", "gpu-thermal", "61500\n"),
+                 _Zone("thermal_zone2", "bogus", "-300000\n")]
+        with mock.patch.object(core.Path, "glob", return_value=zones):
+            self.assertEqual(core._thermal_temperatures(), {"cpu-thermal": 45.0, "gpu-thermal": 61.5})
 
 
 class TestJevRetryPolicy(unittest.TestCase):
@@ -856,10 +879,23 @@ class TestJevRetryPolicy(unittest.TestCase):
                 client.system_one({}, {})
         return m.call_count, ctx.exception
 
-    def test_region_block_is_fatal_and_not_retried(self):
-        calls, exc = self._call(451)
-        self.assertEqual(calls, 1)
-        self.assertTrue(exc.fatal)
+    def test_auth_errors_are_fatal_and_not_retried(self):
+        for code in (401, 403):
+            calls, exc = self._call(code)
+            self.assertEqual(calls, 1)
+            self.assertTrue(exc.fatal)
+
+    def test_other_client_errors_pause_instead_of_disabling(self):
+        for code in (400, 404, 451):
+            calls, exc = self._call(code)
+            self.assertEqual(calls, 1)
+            self.assertFalse(exc.fatal)
+            self.assertGreater(exc.cooldown, 0)
+
+    def test_rate_limit_is_retried(self):
+        calls, exc = self._call(429)
+        self.assertEqual(calls, 4)
+        self.assertFalse(exc.fatal)
 
     def test_server_error_is_retried(self):
         calls, exc = self._call(503)

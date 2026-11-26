@@ -132,12 +132,30 @@ from robodiag_jev import (
     validated_verification_checks,
 )
 
+from robodiag_bag import BagError, analyze_bag, format_bag_report
+from robodiag_config import (
+    _JEV_API_KEY_ENV,
+    _JEV_BASE_URL_ENV,
+    _JEV_MODEL_ENV,
+    _LLM_API_KEY_ENV,
+    _LLM_BASE_URL_ENV,
+    _LLM_MODEL_ENV,
+    _llm_provider_defaults,
+    _normalize_llm_base_url,
+    _resolve_env,
+    _resolve_env_source,
+    apply_profile,
+    env_float,
+    list_profiles,
+    load_env,
+)
+from robodiag_report import analyze_trend, build_report_data, format_trend, write_report
 from robodiag_core import (
     SensorAlias,
     match_sensor_alias,
     resolve_topic,
     topics_for_alias,
-    HOST_RESOURCE_RE,
+    is_host_resource_query,
     host_resources,
     DIAG_ERROR,
     DIAG_OK,
@@ -155,7 +173,6 @@ from robodiag_core import (
     is_verify_request,
     load_entry_point_tests,
     now_iso,
-    register_test,
     sample_activity_summary,
     stats_from_samples,
 )
@@ -163,8 +180,6 @@ from robodiag_core import (
 from robodiag_rdcd import (
     AVAILABLE,
     MISSING,
-    NOT_SUPPORTED,
-    TYPE_MISMATCH,
     Rdcd,
     RdcdError,
     capability_status,
@@ -249,7 +264,6 @@ except ImportError as exc:
     raise SystemExit(2) from exc
 
 import importlib.util
-import threading
 
 # AI is optional. ``import openai`` alone takes ~8 s on a Raspberry Pi, so it is only
 # probed here and the real import happens lazily (warmed up in a background thread).
@@ -276,8 +290,9 @@ class _LazyOpenAI:
         def _run() -> None:
             try:
                 self._resolve()
-            except Exception:  # noqa: BLE001 - surfaces again on first real use
-                pass
+            except Exception as exc:  # noqa: BLE001 - also surfaces again on first real use
+                console.print(f"[yellow]LLM client failed to initialise ({type(exc).__name__}: {exc}); "
+                              "the agent will not work until this is fixed.[/yellow]")
 
         threading.Thread(target=_run, name="openai-warmup", daemon=True).start()
 
@@ -356,36 +371,6 @@ def play_banner() -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
-def load_env(path: Path) -> dict[str, str]:
-    cfg: dict[str, str] = {}
-    if not path.exists():
-        return cfg
-    try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            k = k.strip()
-            v = v.strip()
-            # Drop trailing inline comments, then accept shell-style quotes.
-            v = v.split(" #", 1)[0].strip()
-            if len(v) >= 2 and v[0] in ("'", '"') and v[-1] == v[0]:
-                v = v[1:-1]
-            if k:
-                cfg[k] = v
-    except OSError:
-        pass
-    return cfg
-
-
-def env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, default))
-    except (TypeError, ValueError):
-        return default
-
-
 def _diag_level(value: Any) -> int:
     """DiagnosticStatus.level is a `byte` field; ROS 2 Humble maps it to bytes."""
     if isinstance(value, (bytes, bytearray)):
@@ -771,6 +756,63 @@ class HarnessNode(Node):
             sub = self.create_subscription(msg_type, topic, collector.on_message, self.sensor_qos)
             self._dyn_subs[topic] = (collector, type_name, sub)
             return collector, type_name, None
+
+    # ── TF / time sync ───────────────────────────────────────────────────────
+    def _ensure_tf_subscriptions(self) -> str | None:
+        """Create the long-lived /tf and /tf_static subscriptions once; return an error string or None."""
+        with self._dyn_lock:
+            if getattr(self, "_tf_subs", None) is not None:
+                return None
+            try:
+                from tf2_msgs.msg import TFMessage
+            except ImportError:
+                return "tf2_msgs is not installed"
+            self._tf_lock = threading.Lock()
+            self._tf_edges: dict[tuple[str, str], dict[str, Any]] = {}
+            static_qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=100,
+                                    reliability=ReliabilityPolicy.RELIABLE,
+                                    durability=DurabilityPolicy.TRANSIENT_LOCAL)
+            dyn_qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=100,
+                                 reliability=ReliabilityPolicy.RELIABLE,
+                                 durability=DurabilityPolicy.VOLATILE)
+            self._tf_subs = (
+                self.create_subscription(TFMessage, "/tf", lambda m: self._on_tf(m, False), dyn_qos),
+                self.create_subscription(TFMessage, "/tf_static", lambda m: self._on_tf(m, True), static_qos),
+            )
+            return None
+
+    def _on_tf(self, msg: Any, static: bool) -> None:
+        now = self.get_clock().now().nanoseconds / 1e9
+        with self._tf_lock:
+            for t in msg.transforms:
+                stamp = t.header.stamp.sec + t.header.stamp.nanosec / 1e9
+                key = (t.header.frame_id.lstrip("/"), t.child_frame_id.lstrip("/"))
+                e = self._tf_edges.setdefault(key, {"count": 0})
+                e.update(static=static, last_recv=now, offset=(stamp - now) if stamp > 0 else None)
+                e["count"] += 1
+
+    def sample_tf(self, duration_s: float = 3.0) -> dict[str, Any]:
+        """Collect transforms for ``duration_s`` and describe the frame tree (see analyze_tf in robodiag_core)."""
+        err = self._ensure_tf_subscriptions()
+        if err:
+            return {"ok": False, "error": err}
+        duration_s = max(0.5, min(float(duration_s), 30.0))
+        with self._tf_lock:
+            for e in self._tf_edges.values():
+                if not e["static"]:
+                    e["count"] = 0  # per-window count for dynamic transforms
+        time.sleep(duration_s)
+        now = self.get_clock().now().nanoseconds / 1e9
+        with self._tf_lock:
+            edges = [
+                {"parent": p, "child": c, "static": e["static"], "count": e["count"],
+                 "last_age_s": round(now - e["last_recv"], 3),
+                 "stamp_offset_s": None if e["offset"] is None else round(e["offset"], 3)}
+                for (p, c), e in self._tf_edges.items()
+            ]
+        if not edges:
+            return {"ok": False, "error": "no transforms on /tf or /tf_static"}
+        return {"ok": True, "duration_s": duration_s, "edges": sorted(edges, key=lambda x: (x["parent"], x["child"]))}
 
     def topic_snapshot(self, topic: str, timeout_s: float = 3.0) -> dict[str, Any]:
         timeout_s = max(0.2, min(float(timeout_s), 15.0))
@@ -1298,74 +1340,6 @@ _JEV_NONE_TOPIC = "none_of_the_above"  # always offered so Jev is never forced i
 # verify. The verification planner turns those points into read-only tool calls,
 # the harness executes them, and the explainer runs again with the new evidence.
 _JEV_MAX_VERIFY_ROUNDS = 2
-
-# Environment-variable aliases, in priority order (first non-empty value wins).
-# The LLM is any OpenAI-compatible chat/functions API, so we accept the generic
-# LLM_*, the OpenAI SDK's own OPENAI_*, and the legacy DEEPSEEK_* names. Jev
-# accepts JEV_* with the legacy TYPESAFE_* names still working.
-_LLM_API_KEY_ENV = ("LLM_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY")
-_LLM_BASE_URL_ENV = ("LLM_BASE_URL", "OPENAI_BASE_URL", "DEEPSEEK_BASE_URL")
-_LLM_MODEL_ENV = ("LLM_MODEL", "OPENAI_MODEL", "DEEPSEEK_MODEL")
-_JEV_API_KEY_ENV = ("JEV_API_KEY", "TYPESAFE_API_KEY")
-_JEV_BASE_URL_ENV = ("JEV_BASE_URL", "TYPESAFE_BASE_URL")
-_JEV_MODEL_ENV = ("JEV_MODEL", "TYPESAFE_MODEL")
-
-_LLM_DEFAULT_BASE_URL = "https://api.deepseek.com"
-_LLM_DEFAULT_MODEL = "deepseek-chat"
-
-
-def _resolve_env_source(
-    names: tuple[str, ...], env_file: dict[str, str]
-) -> tuple[str, str | None]:
-    """Return ``(value, matched_name)`` for the first non-empty alias.
-
-    Environment variables take priority over the ``~/.robodiag.env`` file, and
-    within each source the aliases are tried in the given order.
-    """
-    for name in names:
-        value = os.environ.get(name)
-        if value and value.strip():
-            return value.strip(), name
-    for name in names:
-        value = env_file.get(name)
-        if value and value.strip():
-            return value.strip(), name
-    return "", None
-
-
-def _resolve_env(names: tuple[str, ...], env_file: dict[str, str], default: str = "") -> str:
-    value, _ = _resolve_env_source(names, env_file)
-    return value or default
-
-
-def _llm_provider_defaults(key_source: str | None) -> tuple[str, str]:
-    """Return ``(base_url, model)`` implied by the matched LLM key variable.
-
-    ``OPENAI_API_KEY`` implies the official OpenAI endpoint and model; every
-    other source (CLI flag, ``LLM_*``, legacy ``DEEPSEEK_*``) keeps the
-    DeepSeek-based built-in defaults for backward compatibility.
-    """
-    if key_source == "OPENAI_API_KEY":
-        return "https://api.openai.com/v1", "gpt-4o-mini"
-    return _LLM_DEFAULT_BASE_URL, _LLM_DEFAULT_MODEL
-
-
-def _normalize_llm_base_url(url: str) -> str:
-    """Normalize an OpenAI-compatible base URL for the OpenAI SDK.
-
-    The SDK appends the operation path (e.g. ``/chat/completions``) to
-    ``base_url``. The official OpenAI endpoint requires the ``/v1`` version
-    prefix, so accept ``https://api.openai.com`` as well as the full
-    ``https://api.openai.com/v1`` form. Other providers are left untouched.
-    """
-    url = url.strip().rstrip("/")
-    if not url:
-        return url
-    host = url.split("://", 1)[-1].split("/", 1)[0].lower()
-    if host.endswith("openai.com") and not url.endswith("/v1"):
-        return url + "/v1"
-    return url
-
 
 def _resolve_jev_settings(
     api_key_override: str | None = None,
@@ -2313,6 +2287,15 @@ def handle_action(
     return False
 
 
+def print_trend_alerts(history_store: HistoryStore, only_test: str | None = None) -> None:
+    """Print degradation alerts from the stored history (optionally just for one test)."""
+    alerts = analyze_trend(history_store.full(300))
+    for a in alerts:
+        if only_test is None or a["test_id"] == only_test:
+            color = "red" if a["level"] == "FAIL" else "yellow"
+            console.print(f"[{color}]⚠ trend: {escape(a['message'])}[/{color}]")
+
+
 def show_host_resources(res: dict[str, Any], lang: str) -> None:
     zh = lang == "zh"
     lines = []
@@ -2330,7 +2313,14 @@ def show_host_resources(res: dict[str, Any], lang: str) -> None:
             f"({m['available_mb']} MB {'可用' if zh else 'available'} / {m['total_mb']} MB)"
         )
     if "temperature_c" in res:
-        lines.append(f"{'温度' if zh else 'Temperature'}: {res['temperature_c']} °C")
+        zones = res.get("temperatures_c", {})
+        detail = "  (" + ", ".join(f"{k} {v}" for k, v in zones.items()) + ")" if len(zones) > 1 else ""
+        lines.append(f"{'温度' if zh else 'Temperature'}: {res['temperature_c']} °C{detail}")
+    for d in res.get("disk", []):
+        lines.append(
+            f"{'磁盘' if zh else 'Disk'} {d['path']}: {d['used_percent']}%  "
+            f"({d['free_gb']} GB {'可用' if zh else 'free'} / {d['total_gb']} GB)"
+        )
     if not lines:
         lines.append("Host resource info unavailable on this system.")
     lines.append(f"[dim]{'来源: 运行 harness 的主机 (/proc)' if zh else 'Source: host running harness (/proc)'}[/dim]")
@@ -2449,6 +2439,10 @@ REPL_COMMANDS: list[tuple[str, str]] = [
     ("/tests", "Test catalog"),
     ("/run", "Run a deterministic test"),
     ("/history", "Recent test runs"),
+    ("/trend", "Result trends and degradation alerts from history"),
+    ("/report", "Export a Markdown/HTML diagnostic report: /report [md|html] [path]"),
+    ("/bag", "Offline health check of a rosbag2 recording: /bag <path>"),
+    ("/profile", "List threshold profiles / show the active one"),
     ("/baseline", "Show rolling drift baseline"),
     ("/safety", "Show the motion Safety Gate"),
     ("/timeline", "Recent /rosout log timeline"),
@@ -2878,6 +2872,7 @@ def repl(
     # The most recent diagnosis, kept so the operator can continue verification
     # (``/verify`` or "continue verify") without re-running the whole diagnosis.
     last_verification: tuple[DiagnosticState, str, str] | None = None
+    jev_paused_until = 0.0  # time.monotonic() deadline while Jev is paused after a soft failure
     console.print(HELP)
 
     def handle_verify() -> None:
@@ -2954,6 +2949,7 @@ def repl(
                 with console.status("[bold #00E5FF]Running composite diagnostics…[/bold #00E5FF]"):
                     result = runner.run("system_health")
                 print_test(result)
+                print_trend_alerts(history_store, "system_health")
                 _note_repl_activity(repl_activity, f"/check → system_health {result.get('result')}: {result.get('summary', '')}")
                 continue
             if line == "/tests":
@@ -2975,6 +2971,7 @@ def repl(
                     _note_repl_activity(repl_activity, f"/run {test_id} → error: {result['error']}")
                 else:
                     print_test(result)
+                    print_trend_alerts(history_store, test_id)
                     _note_repl_activity(repl_activity, f"/run {test_id} → {result.get('result')}: {result.get('summary', '')}")
                 continue
             if line.startswith("/topic "):
@@ -3024,6 +3021,51 @@ def repl(
                     )
                 console.print(t)
                 _note_repl_activity(repl_activity, f"/history → {len(rows)} recent run(s)")
+                continue
+            if line == "/trend":
+                rows = history_store.full(300)
+                console.print(escape(format_trend(rows, analyze_trend(rows))))
+                continue
+            if line == "/report" or line.startswith("/report "):
+                parts = line.split()[1:]
+                fmt = "html" if "html" in parts else "md"
+                path = next((x for x in parts if x not in ("md", "html")), None)
+                rows = history_store.full(200)
+                if not rows:
+                    console.print("[yellow]No test history yet; run /check or /run first.[/yellow]")
+                    continue
+                latest: dict[str, dict[str, Any]] = {}
+                for r in rows:  # oldest first, so the last run of each test wins
+                    latest[r["test_id"]] = r
+                conclusion = last_verification[1] if last_verification else ""
+                data = build_report_data(
+                    list(latest.values()), conclusion=conclusion,
+                    meta={"RDCD": node.rdcd.name if node.rdcd else "generic", "Version": VERSION},
+                    host=host_resources(), alerts=analyze_trend(rows),
+                )
+                try:
+                    out = write_report(data, path, fmt)
+                except (OSError, ValueError) as exc:
+                    console.print(f"[red]Cannot write report: {escape(str(exc))}[/red]")
+                    continue
+                console.print(f"[green]Report written to {escape(str(out))}[/green]")
+                _note_repl_activity(repl_activity, f"/report → {out}")
+                continue
+            if line.startswith("/bag "):
+                bag_path = line.split(maxsplit=1)[1].strip()
+                try:
+                    with console.status("[bold #00E5FF]Analysing bag…[/bold #00E5FF]"):
+                        res = analyze_bag(bag_path)
+                except (BagError, OSError) as exc:
+                    console.print(f"[red]{escape(str(exc))}[/red]")
+                    continue
+                console.print(escape(format_bag_report(res)))
+                _note_repl_activity(repl_activity, f"/bag {bag_path} → {res['overall']}: {res['summary']}")
+                continue
+            if line == "/profile":
+                active = os.environ.get("ROBODIAG_PROFILE") or "(none)"
+                console.print(f"Active profile: {escape(active)}")
+                console.print("Available: " + (escape(", ".join(list_profiles())) or "(none; put NAME.env in ~/.robodiag/profiles/)"))
                 continue
             if line == "/safety":
                 result = gate.check_for_motion()
@@ -3131,11 +3173,13 @@ def repl(
 
             lang = detect_language(line)
 
-            if HOST_RESOURCE_RE.search(line):
+            host_query = is_host_resource_query(line)
+            router_active = request_router is not None and time.monotonic() >= jev_paused_until
+            if host_query and not router_active:
                 show_host_resources(host_resources(), lang)
                 continue
 
-            if request_router is not None:
+            if router_active:
                 try:
                     route = request_router.route(line)
                 except JevError as exc:
@@ -3148,7 +3192,12 @@ def repl(
                             "using the LLM function-calling agent instead.[/yellow]"
                         )
                     else:
-                        console.print(f"[yellow]Jev request routing failed ({exc}); using the LLM agent for this message.[/yellow]")
+                        if exc.cooldown:
+                            jev_paused_until = time.monotonic() + exc.cooldown
+                        console.print(
+                            f"[yellow]Jev request routing failed ({exc}); using the LLM agent"
+                            f"{f' for the next {int(exc.cooldown)}s' if exc.cooldown else ' for this message'}.[/yellow]"
+                        )
                     if llm_client is None:
                         console.print("[red]AI Agent not configured. Set LLM_API_KEY or OPENAI_API_KEY to enable natural-language diagnosis.[/red]")
                         continue
@@ -3171,6 +3220,10 @@ def repl(
                         continue
                     console.print("[yellow]Action unresolved; falling back to diagnosis.[/yellow]")
                     route = RequestRoute(mode=RequestMode.DIAGNOSIS)
+
+                if host_query:  # fallback: only when routing did not claim it as a query/action
+                    show_host_resources(host_resources(), lang)
+                    continue
 
                 if route.mode is RequestMode.CHAT:
                     handle_chat(llm_client, model, line, lang=lang, activity=repl_activity)
@@ -3279,6 +3332,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cmd-vel-topic", default="/cmd_vel", help="fallback software-stop Twist topic")
     parser.add_argument("--estop-service", default="", help="optional std_srvs/Trigger E-stop service")
     parser.add_argument("--db", default=os.environ.get("ROBODIAG_DB", "~/.robodiag_ros2.db"))
+    parser.add_argument("--profile", default=os.environ.get("ROBODIAG_PROFILE", ""),
+                        help="per-robot threshold profile ~/.robodiag/profiles/NAME.env (ROBODIAG_* keys)")
     parser.add_argument(
         "--rdcd",
         default="",
@@ -3327,6 +3382,14 @@ def main(argv: list[str] | None = None) -> int:
     time.sleep(0.8)
     node._ensure_common_subscriptions()
 
+    if args.profile:
+        try:
+            applied = apply_profile(args.profile)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"robodiag: {exc}", file=sys.stderr)
+            return 2
+        os.environ["ROBODIAG_PROFILE"] = args.profile
+        console.print(f"[dim]Profile {escape(args.profile)}: {len(applied)} threshold(s) applied.[/dim]")
     history_store = HistoryStore(Path(args.db))
     baseline_store = BaselineStore(Path(args.db))
     # Discover third-party deterministic tests declared via ``robodiag.tests``

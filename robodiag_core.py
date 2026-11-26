@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -52,6 +53,8 @@ MAX_CMD_VEL_ANGULAR = 6.0  # rad/s
 # Tier-2 cross-sensor consistency thresholds. Degrees are used for attitude so
 # the numbers read naturally in test summaries; angular rates stay in rad/s.
 ODOM_IMU_ROLL_PITCH_WARN_DEG = 5.0
+TF_MAX_STAMP_OFFSET_S = 0.5   # |header stamp - receive time| above this suggests clock skew
+TF_DYNAMIC_STALE_S = 2.0      # a dynamic transform silent for this long is stale
 ODOM_IMU_ROLL_PITCH_FAIL_DEG = 15.0
 ODOM_IMU_ANGULAR_WARN_RAD_S = 0.05
 ODOM_IMU_ANGULAR_FAIL_RAD_S = 0.20
@@ -153,14 +156,77 @@ def match_sensor_alias(text: str) -> SensorAlias | None:
     return None
 
 
+# A host-resource question needs an explicit host subject (cpu / memory / disk / the computer
+# itself). Bare "temperature", "load" or "负载" are deliberately NOT enough: they usually refer
+# to a motor, a joint, a payload or a sensor topic.
 HOST_RESOURCE_RE = re.compile(
-    r"\bcpu\b|处理器|占用率|\b(memory|ram)\b|内存|\bload average\b|负载|\btemperature\b|\btemp\b|温度|发烫|\bdisk\b|磁盘|硬盘",
+    r"\bcpu\b|\bram\b|\bmemory\b|\bdisk\b|\bload average\b|\bsystem load\b|\bstorage\b|\bswap\b"
+    r"|处理器|内存|磁盘|硬盘|存储空间|系统负载|主机|本机|工控机|机载电脑|上位机|树莓派"
+    r"|\b(host|computer|board|soc|jetson|raspberry|nuc)\b.{0,24}(temp|temperature|hot|load)"
+    r"|(temp|temperature|hot|load).{0,24}\b(of the (host|computer|board)|host|computer|board|soc)\b"
+    r"|(主机|本机|工控机|机载电脑|板子|开发板|芯片|处理器).{0,8}(温度|发烫|负载)"
+    r"|\bcpu\s*(temp|temperature|负载)|cpu.{0,4}(温度|负载|占用)",
+    re.IGNORECASE,
+)
+
+# Words that mean the user is asking about a robot component, not the host computer.
+_ROBOT_COMPONENT_RE = re.compile(
+    r"\bmotors?\b|\bjoints?\b|\bimu\b|\blidar\b|\bservo|\bpayload\b|\bgripper\b|\bactuator"
+    r"|\bbattery\b|电机|关节|机械臂|夹爪|舵机|电池|有效载荷|\btopics?\b|话题",
     re.IGNORECASE,
 )
 
 
+def is_host_resource_query(text: str) -> bool:
+    """True only for explicit questions about the machine running the harness."""
+    plain = TOPIC_RE.sub(" ", text)
+    if not HOST_RESOURCE_RE.search(plain):
+        return False
+    if match_sensor_alias(text) is not None:
+        return False
+    # "robot arm CPU" style compounds still count when cpu/memory/disk is explicit.
+    explicit = re.search(r"\bcpu\b|\bram\b|\bmemory\b|\bdisk\b|内存|磁盘|硬盘|处理器|主机|本机|工控机|机载电脑|上位机", plain, re.I)
+    return bool(explicit) or not _ROBOT_COMPONENT_RE.search(plain)
+
+
+def _thermal_temperatures() -> dict[str, float]:
+    """Read every /sys/class/thermal zone; keys are zone types (cpu-thermal, x86_pkg_temp, ...)."""
+    out: dict[str, float] = {}
+    base = Path("/sys/class/thermal")
+    try:
+        zones = sorted(base.glob("thermal_zone*"))
+    except OSError:
+        return out
+    for zone in zones:
+        try:
+            name = (zone / "type").read_text(encoding="utf-8").strip() or zone.name
+            value = int((zone / "temp").read_text(encoding="utf-8").strip()) / 1000.0
+        except (OSError, ValueError):
+            continue
+        if -40.0 <= value <= 150.0:
+            key = name if name not in out else f"{name}#{zone.name}"
+            out[key] = round(value, 1)
+    return out
+
+
+def _disk_usage(paths: tuple[str, ...] = ("/",)) -> list[dict[str, Any]]:
+    out = []
+    for path in paths:
+        try:
+            u = shutil.disk_usage(path)
+        except OSError:
+            continue
+        out.append({
+            "path": path,
+            "total_gb": round(u.total / 1e9, 1),
+            "free_gb": round(u.free / 1e9, 1),
+            "used_percent": round(100.0 * u.used / u.total, 1) if u.total else 0.0,
+        })
+    return out
+
+
 def host_resources() -> dict[str, Any]:
-    """CPU / memory / temperature of the machine running the harness (Linux /proc, read-only)."""
+    """CPU / memory / disk / temperature of the machine running the harness (Linux /proc, read-only)."""
     out: dict[str, Any] = {"ok": True, "scope": "host running robodiag-harness"}
     try:
         with open("/proc/loadavg", encoding="utf-8") as f:
@@ -176,7 +242,7 @@ def host_resources() -> dict[str, Any]:
             return sum(vals), vals[3] + (vals[4] if len(vals) > 4 else 0)
 
         t0, i0 = _cpu_times()
-        time.sleep(0.5)
+        time.sleep(0.2)
         t1, i1 = _cpu_times()
         if t1 > t0:
             out["cpu_percent"] = round(100.0 * (1 - (i1 - i0) / (t1 - t0)), 1)
@@ -196,12 +262,76 @@ def host_resources() -> dict[str, Any]:
         }
     except (OSError, ValueError, KeyError) as exc:
         out["memory_error"] = f"{type(exc).__name__}: {exc}"
-    try:
-        with open("/sys/class/thermal/thermal_zone0/temp", encoding="utf-8") as f:
-            out["temperature_c"] = round(int(f.read().strip()) / 1000.0, 1)
-    except (OSError, ValueError):
-        pass
+    temps = _thermal_temperatures()
+    if temps:
+        out["temperatures_c"] = temps
+        out["temperature_c"] = max(temps.values())  # hottest zone
+    disks = _disk_usage()
+    if disks:
+        out["disk"] = disks
     return out
+
+
+def env_float_core(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def analyze_tf(sample: dict[str, Any], max_offset_s: float = TF_MAX_STAMP_OFFSET_S,
+               stale_s: float = TF_DYNAMIC_STALE_S) -> tuple[str, str, list[str]]:
+    """Judge a TF sample: ``{"duration_s", "edges": [{"parent","child","static","count","last_age_s","stamp_offset_s"}]}``.
+
+    Checks frame-tree connectivity (single root, no child with two parents), stale dynamic transforms and
+    header-stamp vs receive-time offset (clock sync). Returns ``(result, summary, problems)``.
+    """
+    edges = sample.get("edges", [])
+    if not edges:
+        return "SKIP", "No TF transforms received on /tf or /tf_static; skipped.", []
+    parents: dict[str, set[str]] = {}
+    frames: set[str] = set()
+    for e in edges:
+        parents.setdefault(e["child"], set()).add(e["parent"])
+        frames.update((e["parent"], e["child"]))
+    problems: list[str] = []
+    hard = False
+    roots = sorted(f for f in frames if f not in parents)
+    if len(roots) > 1:
+        hard = True
+        problems.append(f"TF tree is disconnected: {len(roots)} separate roots ({', '.join(roots[:5])})")
+    elif not roots:
+        hard = True
+        problems.append("TF graph has no root (cycle)")
+    for child, ps in sorted(parents.items()):
+        if len(ps) > 1:
+            hard = True
+            problems.append(f"frame {child} has multiple parents: {', '.join(sorted(ps))}")
+    # Cycle detection on the parent map.
+    for start in parents:
+        seen, cur = set(), start
+        while cur in parents and cur not in seen:
+            seen.add(cur)
+            cur = sorted(parents[cur])[0]
+        if cur in seen and cur in parents:
+            hard = True
+            problems.append(f"TF cycle through frame {cur}")
+            break
+    stale = [f"{e['parent']}->{e['child']}" for e in edges if not e.get("static") and (e.get("last_age_s") or 0) > stale_s]
+    if stale:
+        problems.append(f"{len(stale)} dynamic transform(s) stale >{stale_s:g}s: {', '.join(stale[:4])}")
+    skewed = [e for e in edges if not e.get("static") and e.get("stamp_offset_s") is not None
+              and abs(e["stamp_offset_s"]) > max_offset_s]
+    if skewed:
+        worst = max(skewed, key=lambda e: abs(e["stamp_offset_s"]))
+        problems.append(
+            f"{len(skewed)} transform(s) with header stamp off by >{max_offset_s:g}s from receive time "
+            f"(worst {worst['parent']}->{worst['child']}: {worst['stamp_offset_s']:+.2f}s) - check clock sync/use_sim_time")
+    if hard:
+        return "FAIL", "; ".join(problems), problems
+    if problems:
+        return "WARN", "; ".join(problems), problems
+    return "PASS", f"TF tree OK: {len(frames)} frames, {len(edges)} transforms, single root {roots[0]}.", []
 
 
 def topics_for_alias(alias: SensorAlias, topics: list[dict[str, Any]], rdcd: Any = None) -> list[dict[str, Any]]:
@@ -464,6 +594,28 @@ class HistoryStore:
                     )
             finally:
                 con.close()
+
+    def full(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Most recent runs (oldest first) including the stored evidence payload."""
+        limit = max(1, min(int(limit), 2000))
+        with self._lock:
+            con = self._connect()
+            try:
+                with con:
+                    rows = con.execute(
+                        "SELECT id, started_at, test_id, result, summary, duration_ms, payload "
+                        "FROM test_history ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            finally:
+                con.close()
+        out = []
+        for row in reversed(rows):
+            try:
+                payload = json.loads(row[6])
+            except ValueError:
+                payload = {}
+            out.append({"id": row[0], "started_at": row[1], "test_id": row[2], "result": row[3],
+                        "summary": row[4], "duration_ms": row[5], "evidence": payload.get("evidence", [])})
+        return out
 
     def recent(self, limit: int = 10) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 100))
@@ -812,6 +964,11 @@ TEST_CATALOG = {
         "description": "Compare current joint-state rate and IMU attitude/acceleration against the rolling baseline and flag drift beyond 3σ (WARN) / 5σ (FAIL). Builds the baseline on first runs.",
         "writes": False,
         "requires": "joint_states",
+    },
+    "tf_health": {
+        "name": "TF tree and time sync",
+        "description": "Sample /tf and /tf_static: single connected tree, no duplicate parents or cycles, no stale dynamic transforms, header stamps consistent with the clock.",
+        "writes": False,
     },
     "odometry_vs_imu": {
         "name": "Odometry vs IMU consistency",
@@ -1329,6 +1486,18 @@ class TestRunner:
         if sigma > BASELINE_WARN_SIGMA:
             return "WARN", f"Baseline drift: {worst['metric']} at {sigma:.1f}σ ({detail}).", evidence
         return "PASS", f"No significant drift (max {sigma:.1f}σ across {len(established)} metric(s)).", evidence
+
+    def _test_tf_health(self) -> tuple[str, str, list[dict[str, Any]]]:
+        sample = self.node.sample_tf(duration_s=3.0)
+        evidence = [asdict(Evidence("/tf", "sample", sample, now_iso()))]
+        if not sample.get("ok"):
+            return "SKIP", f"TF unavailable ({sample.get('error')}); skipped.", evidence
+        result, summary, _ = analyze_tf(
+            sample,
+            max_offset_s=env_float_core("ROBODIAG_TF_MAX_STAMP_OFFSET_S", TF_MAX_STAMP_OFFSET_S),
+            stale_s=env_float_core("ROBODIAG_TF_STALE_S", TF_DYNAMIC_STALE_S),
+        )
+        return result, summary, evidence
 
     def _test_odometry_vs_imu(self) -> tuple[str, str, list[dict[str, Any]]]:
         declared = self.rdcd is not None

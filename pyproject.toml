@@ -5,3 +5,18 @@
 # --no-build-isolation to build fully offline with the system setuptools.
 requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 140
+target-version = "py310"
+extend-exclude = ["build", "dist"]
+
+[tool.ruff.lint]
+# Pyflakes (undefined names / unused imports) and import-position errors only.
+select = ["F", "E402", "E711", "E712", "E713", "E714", "E721", "E722"]
+
+[tool.coverage.run]
+omit = ["test_*.py", "setup.py"]
+
+[tool.coverage.report]
+fail_under = 70

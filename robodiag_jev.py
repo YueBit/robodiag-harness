@@ -35,6 +35,9 @@ from enum import Enum
 from typing import Any
 
 TYPESAFE_DEFAULT_BASE_URL = "https://api.typesafe.ai"
+AUTH_ERROR_CODES = (401, 403)
+CLIENT_ERROR_COOLDOWN_S = 300.0
+RETRY_EXHAUSTED_COOLDOWN_S = 60.0
 TYPESAFE_DEFAULT_MODEL = "jev-latest"
 TYPESAFE_ENDPOINT = "/v1/systemone"
 
@@ -267,9 +270,10 @@ def validated_verification_checks(
 class JevError(RuntimeError):
     """Jev request failure. ``fatal`` means retrying (or keeping Jev on) is pointless."""
 
-    def __init__(self, message: str = "", *, fatal: bool = False) -> None:
+    def __init__(self, message: str = "", *, fatal: bool = False, cooldown: float = 0.0) -> None:
         super().__init__(message)
         self.fatal = fatal
+        self.cooldown = cooldown  # seconds the caller should skip Jev before trying again
 
 
 class JevClient:
@@ -318,16 +322,19 @@ class JevClient:
                 except OSError:
                     pass
                 message = f"Jev HTTP {exc.code}: {detail or exc.reason}"
-                # Only rate limits, timeouts and server errors are worth retrying; any other
-                # 4xx (auth, validation, 451 region block, ...) will fail the same way again.
-                if exc.code not in (408, 429) and exc.code < 500:
+                # Bad credentials never fix themselves: disable Jev. Other client errors
+                # (validation, 451 region block, ...) are not retried in this call but only
+                # pause Jev for a while; rate limits, timeouts and 5xx are retried with backoff.
+                if exc.code in AUTH_ERROR_CODES:
                     raise JevError(message, fatal=True) from exc
-                last_error = JevError(message)
+                if exc.code not in (408, 429) and exc.code < 500:
+                    raise JevError(message, cooldown=CLIENT_ERROR_COOLDOWN_S) from exc
+                last_error = JevError(message, cooldown=RETRY_EXHAUSTED_COOLDOWN_S)
             except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as exc:
                 last_error = JevError(f"Jev connection error: {type(exc).__name__}: {exc}")
             if attempt < 3:
                 time.sleep(min(2 ** attempt, 8))  # 1s, 2s, 4s backoff
-        raise JevError(f"Jev request failed after retries: {last_error}")
+        raise JevError(f"Jev request failed after retries: {last_error}", cooldown=RETRY_EXHAUSTED_COOLDOWN_S)
 
 
 @dataclass

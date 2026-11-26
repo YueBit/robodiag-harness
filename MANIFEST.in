@@ -2,6 +2,9 @@ include LICENSE
 include NOTICE
 include README.md
 include robodiag_ros2.py
+include robodiag_config.py
+include robodiag_report.py
+include robodiag_bag.py
 include robodiag_jev.py
 include robodiag_core.py
 include robodiag_rdcd.py
