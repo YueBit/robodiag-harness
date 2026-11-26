@@ -483,7 +483,7 @@ Put `ROBODIAG_*` thresholds in `~/.robodiag/profiles/<name>.env` (same `KEY=VALU
 
 ## Reports, trends and offline analysis
 
-* `/report [md|html] [path]` exports results, evidence, diagnosis and host info (default `~/.robodiag/reports/`).
+* `/report [md|html] [path]` exports this session's latest result per test (with timestamps), evidence, diagnosis and host info (default `~/.robodiag/reports/`).
 * `/trend` shows history alerts (repeated failures, regressions, slowdowns); also printed after `/run` and `/check`.
 * `/bag <path>` (or `python3 robodiag_bag.py <path> [--expect /topic]`) checks a rosbag2 `.db3` offline: rate, gaps, stopped or missing topics. No MCAP, no message contents.
 

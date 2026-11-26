@@ -99,6 +99,7 @@ import json
 import math
 import os
 import re
+import shlex
 import traceback
 import sys
 import threading
@@ -149,7 +150,7 @@ from robodiag_config import (
     list_profiles,
     load_env,
 )
-from robodiag_report import analyze_trend, build_report_data, format_trend, write_report
+from robodiag_report import analyze_trend, build_report_data, format_trend, latest_per_test, write_report
 from robodiag_core import (
     SensorAlias,
     match_sensor_alias,
@@ -2872,6 +2873,7 @@ def repl(
     # The most recent diagnosis, kept so the operator can continue verification
     # (``/verify`` or "continue verify") without re-running the whole diagnosis.
     last_verification: tuple[DiagnosticState, str, str] | None = None
+    session_started_at = now_iso()
     jev_paused_until = 0.0  # time.monotonic() deadline while Jev is paused after a soft failure
     console.print(HELP)
 
@@ -3027,19 +3029,21 @@ def repl(
                 console.print(escape(format_trend(rows, analyze_trend(rows))))
                 continue
             if line == "/report" or line.startswith("/report "):
-                parts = line.split()[1:]
+                try:
+                    parts = shlex.split(line)[1:]
+                except ValueError as exc:
+                    console.print(f"[red]Cannot parse command: {escape(str(exc))}[/red]")
+                    continue
                 fmt = "html" if "html" in parts else "md"
                 path = next((x for x in parts if x not in ("md", "html")), None)
                 rows = history_store.full(200)
-                if not rows:
-                    console.print("[yellow]No test history yet; run /check or /run first.[/yellow]")
+                latest = latest_per_test(rows, since=session_started_at)  # this session only
+                if not latest:
+                    console.print("[yellow]No test results from this session yet; run /check or /run first.[/yellow]")
                     continue
-                latest: dict[str, dict[str, Any]] = {}
-                for r in rows:  # oldest first, so the last run of each test wins
-                    latest[r["test_id"]] = r
                 conclusion = last_verification[1] if last_verification else ""
                 data = build_report_data(
-                    list(latest.values()), conclusion=conclusion,
+                    latest, conclusion=conclusion,
                     meta={"RDCD": node.rdcd.name if node.rdcd else "generic", "Version": VERSION},
                     host=host_resources(), alerts=analyze_trend(rows),
                 )
@@ -3331,7 +3335,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--controller-manager", default="/controller_manager", help="controller_manager node namespace")
     parser.add_argument("--cmd-vel-topic", default="/cmd_vel", help="fallback software-stop Twist topic")
     parser.add_argument("--estop-service", default="", help="optional std_srvs/Trigger E-stop service")
-    parser.add_argument("--db", default=os.environ.get("ROBODIAG_DB", "~/.robodiag_ros2.db"))
+    parser.add_argument("--db", default="", help="history database (default: $ROBODIAG_DB or ~/.robodiag_ros2.db)")
     parser.add_argument("--profile", default=os.environ.get("ROBODIAG_PROFILE", ""),
                         help="per-robot threshold profile ~/.robodiag/profiles/NAME.env (ROBODIAG_* keys)")
     parser.add_argument(
@@ -3359,7 +3363,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"robodiag: {exc}", file=sys.stderr)
         return 2
 
+    applied_profile: dict[str, str] | None = None
+    if args.profile:
+        try:
+            applied_profile = apply_profile(args.profile)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"robodiag: {exc}", file=sys.stderr)
+            return 2
+        os.environ["ROBODIAG_PROFILE"] = args.profile
+    args.db = args.db or os.environ.get("ROBODIAG_DB", "~/.robodiag_ros2.db")
+
     play_banner()
+    if applied_profile is not None:
+        console.print(f"[dim]Profile {escape(args.profile)}: {len(applied_profile)} threshold(s) applied.[/dim]")
 
     # Pass ROS-specific args through to rclpy; our own args were already parsed.
     # rclpy/rcl treat args[0] as the program name and only scan args[1:] for
@@ -3382,14 +3398,6 @@ def main(argv: list[str] | None = None) -> int:
     time.sleep(0.8)
     node._ensure_common_subscriptions()
 
-    if args.profile:
-        try:
-            applied = apply_profile(args.profile)
-        except (FileNotFoundError, ValueError) as exc:
-            print(f"robodiag: {exc}", file=sys.stderr)
-            return 2
-        os.environ["ROBODIAG_PROFILE"] = args.profile
-        console.print(f"[dim]Profile {escape(args.profile)}: {len(applied)} threshold(s) applied.[/dim]")
     history_store = HistoryStore(Path(args.db))
     baseline_store = BaselineStore(Path(args.db))
     # Discover third-party deterministic tests declared via ``robodiag.tests``

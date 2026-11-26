@@ -174,3 +174,34 @@ class TestProfiles(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_latest_per_test_limits_to_session():
+    from robodiag_report import latest_per_test
+
+    rows = [
+        {"id": 1, "started_at": "2026-01-01T10:00:00+0800", "test_id": "imu_health", "result": "FAIL"},
+        {"id": 2, "started_at": "2026-01-02T10:00:00+0800", "test_id": "imu_health", "result": "PASS"},
+        {"id": 3, "started_at": "2026-01-02T10:00:00+0800", "test_id": "tf_health", "result": "WARN"},
+    ]
+    assert {r["test_id"]: r["result"] for r in latest_per_test(rows)} == {"imu_health": "PASS", "tf_health": "WARN"}
+    assert [r["test_id"] for r in latest_per_test(rows, since="2026-01-03T00:00:00+0800")] == []
+    assert len(latest_per_test(rows, since="2026-01-02T00:00:00+0800")) == 2
+
+
+def test_report_shows_when_column():
+    from robodiag_report import build_report_data, render_html, render_markdown
+
+    data = build_report_data([{"test_id": "a", "result": "PASS", "summary": "ok", "duration_ms": 1,
+                               "started_at": "2026-01-02T10:00:00+0800"}])
+    assert "2026-01-02T10:00:00+0800" in render_markdown(data)
+    assert "2026-01-02T10:00:00+0800" in render_html(data)
+
+
+def test_host_query_ignores_swap_and_storage_in_robot_context():
+    from robodiag_core import is_host_resource_query
+
+    assert not is_host_resource_query("swap the controller")
+    assert not is_host_resource_query("check rosbag storage format")
+    assert is_host_resource_query("how much disk space is left")
+    assert is_host_resource_query("is swap usage high")

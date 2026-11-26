@@ -91,6 +91,16 @@ def format_trend(rows: list[dict[str, Any]], alerts: list[dict[str, Any]]) -> st
 # ──────────────────────────────────────────────────────────────────────────────
 # Report rendering
 # ──────────────────────────────────────────────────────────────────────────────
+def latest_per_test(rows: list[dict[str, Any]], since: str | None = None) -> list[dict[str, Any]]:
+    """Newest run of each test; ``since`` (ISO timestamp) drops runs that started earlier (e.g. older sessions)."""
+    latest: dict[str, dict[str, Any]] = {}
+    for r in sorted(rows, key=lambda x: (x.get("started_at", ""), x.get("id", 0))):
+        if since and r.get("started_at", "") < since:
+            continue
+        latest[r["test_id"]] = r
+    return list(latest.values())
+
+
 def _short(value: Any, limit: int = 300) -> str:
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -134,10 +144,10 @@ def render_markdown(data: dict[str, Any]) -> str:
         out += ["", "## Diagnosis", "", data["conclusion"].strip()]
     if data["alerts"]:
         out += ["", "## Trend alerts", ""] + [f"- **{a['level']}** {a['message']}" for a in data["alerts"]]
-    out += ["", "## Test results", "", "| Test | Result | Duration | Summary |", "|---|---|---|---|"]
+    out += ["", "## Test results", "", "| Test | When | Result | Duration | Summary |", "|---|---|---|---|---|"]
     for r in data["results"]:
         summary = r["summary"].replace("|", "\\|").replace("\n", " ")
-        out.append(f"| {r['test_id']} | {_BADGE.get(r['result'], '')} {r['result']} | {r.get('duration_ms', 0)} ms | {summary} |")
+        out.append(f"| {r['test_id']} | {r.get('started_at', '')} | {_BADGE.get(r['result'], '')} {r['result']} | {r.get('duration_ms', 0)} ms | {summary} |")
     ev_blocks = []
     for r in data["results"]:
         if r.get("evidence"):
@@ -156,7 +166,7 @@ def render_markdown(data: dict[str, Any]) -> str:
 def render_html(data: dict[str, Any]) -> str:
     esc = html.escape
     rows = "".join(
-        f"<tr><td>{esc(r['test_id'])}</td>"
+        f"<tr><td>{esc(r['test_id'])}</td><td>{esc(str(r.get('started_at', '')))}</td>"
         f"<td style='color:{_COLOR.get(r['result'], '#000')};font-weight:600'>{esc(r['result'])}</td>"
         f"<td>{r.get('duration_ms', 0)} ms</td><td>{esc(r['summary'])}</td></tr>"
         for r in data["results"]
@@ -184,7 +194,7 @@ th{{background:#f4f4f4}}code{{background:#f4f4f4;padding:1px 4px;border-radius:3
 {conclusion}
 {f'<h2>Trend alerts</h2><ul>{alerts}</ul>' if alerts else ''}
 <h2>Test results</h2>
-<table><tr><th>Test</th><th>Result</th><th>Duration</th><th>Summary</th></tr>{rows}</table>
+<table><tr><th>Test</th><th>When</th><th>Result</th><th>Duration</th><th>Summary</th></tr>{rows}</table>
 {f'<h2>Evidence</h2>{evidence}' if evidence else ''}
 {host}
 </body></html>

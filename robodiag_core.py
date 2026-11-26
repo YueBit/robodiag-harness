@@ -160,7 +160,7 @@ def match_sensor_alias(text: str) -> SensorAlias | None:
 # itself). Bare "temperature", "load" or "负载" are deliberately NOT enough: they usually refer
 # to a motor, a joint, a payload or a sensor topic.
 HOST_RESOURCE_RE = re.compile(
-    r"\bcpu\b|\bram\b|\bmemory\b|\bdisk\b|\bload average\b|\bsystem load\b|\bstorage\b|\bswap\b"
+    r"\bcpu\b|\bram\b|\bmemory\b|\bdisk\b|\bload average\b|\bsystem load\b|\bstorage (space|usage|full)\b|\bswap (usage|space|memory)\b"
     r"|处理器|内存|磁盘|硬盘|存储空间|系统负载|主机|本机|工控机|机载电脑|上位机|树莓派"
     r"|\b(host|computer|board|soc|jetson|raspberry|nuc)\b.{0,24}(temp|temperature|hot|load)"
     r"|(temp|temperature|hot|load).{0,24}\b(of the (host|computer|board)|host|computer|board|soc)\b"
